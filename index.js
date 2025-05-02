@@ -1,14 +1,11 @@
 import express from "express"
 import { URL, URLSearchParams } from 'url'
 import { Readable } from 'stream'
-import { error } from "console"
 const router = express.Router()
 
 const monobar_endpoint = process.env.MONOBAR_BACKEND
 const monobar_token = process.env.MONOBAR_TOKEN
-const monobar_user = "98d955f95e154ef9a99233ed4ab16831" || process.env.MONOBAR_USER
-
-router.get('/', async(req,res) => {res.sendStatus(418)})
+const monobar_user =  process.env.MONOBAR_USER
 
 router.get('/ping', async (req, res) => {
     if(!req.headers['x-real-ip']) {
@@ -26,6 +23,53 @@ router.post('/ping', async (req, res) => {
 })
 
 
+router.get('/', async(req,res) => {
+    res.setHeader('Cache-Control', 'public, max-age=120')
+    try {
+        const home = await fetch(`${monobar_endpoint}/Users/${monobar_user}/Views/?fields=ItemTypes`, {
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Emby-Token': monobar_token,
+            }, 
+        })
+        if (!home.ok) {
+            return res.status(home.status).send({message: 'Error fetching home', error: home.statusText})
+        }
+        const data = await home.json()
+        console.log(data)
+        const result = []
+        const host = `${req.protocol}://${req.headers.host}`
+        for (const libraryItem of data.Items) {
+            try {
+                const libraryFetch = await fetch(`${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${libraryItem.Id}&Fields=BasicSyncInfo,CanDelete,CanDownload,PrimaryImageAspectRatio,ProductionYear,Status,EndDate,ImageTypeLimit,EnableImageTypes,Backdrop,Thumb&ImageTypeLimit=1&EnableImageTypes=Primary,Backdrop,Thumb&IncludeItemTypes=${libraryItem.CollectionType}`, {
+                    headers: {
+                        'X-Emby-Token': monobar_token,
+                    }, 
+                })
+                if (!libraryFetch.ok) {
+                    result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: libraryFetch.statusText })
+                    continue
+                }
+                const libraryData = await libraryFetch.json()
+                // Add posterPath to each item using /image endpoint
+                if (libraryData.Items) {
+                    libraryData.Items.forEach(item => {
+                        const tag = item.ImageTags && item.ImageTags.Primary ? item.ImageTags.Primary : ''
+                        item.posterPath = `${host}/monobar/image?type=Primary&id=${item.Id}&tag=${tag}`
+                    })
+                }
+                // Filter out folders (IsFolder: true)
+                const nonFolderItems = (libraryData.Items || []).filter(item => !item.IsFolder)
+                result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: nonFolderItems })
+            } catch (e) {
+                result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: e.message })
+            }
+        }
+        res.send(result)
+    } catch (e) {
+        res.status(500).send("Internal Server Error: " + e.message)
+    }
+})
 
 // Watch Endpoint
 router.get('/watch', async (req, res) => {
@@ -55,7 +99,21 @@ router.get('/watch', async (req, res) => {
                 }
         
                 const data = await info.json()
-                res.send(data)
+                // Update ImageTags to use /image endpoint
+                if (data.BackdropImageTags && data.Id) {
+                    data.BackdropImageTags = `${host}/monobar/image?type=Backdrop&id=${data.Id}&tag=${data.BackdropImageTags[0]}`
+                }
+                if (data.ImageTags && data.Id) {
+                    const newImageTags = {}
+                    for (const [type, tag] of Object.entries(data.ImageTags)) {
+                        newImageTags[type] = `${host}/monobar/image?type=${type}&id=${data.Id}&tag=${tag}`
+                    }
+                    data.ImageTags = newImageTags
+                }
+                const playUrl = `${host}/monobar/watch?intent=play&id=${id}`
+                const result = {...data, playUrl}
+                
+                res.send(result)
                 
             } catch (e) {
                 res.status(500).send("Internal Server Error: " + e.message)
@@ -413,6 +471,7 @@ router.get('/watch/main/playlist', async (req, res) => {
     }
 })
 router.get('/watch/main/segment/*', async (req, res) => {
+    res.setHeader('Cache-Control', 'public, max-age=120')
     const segmentPath = req.params[0]
     const videoId = req.query.videoId
     if (!videoId) {
@@ -457,6 +516,39 @@ router.get('/watch/main/segment/*', async (req, res) => {
         } else {
             res.end()
         }
+    }
+})
+
+// /image endpoint to proxy images from Emby
+router.get('/image', async (req, res) => {
+    res.setHeader('Cache-Control', 'public, max-age=3600')
+    const { type, id, tag } = req.query
+    if (!type || !id || !tag) {
+        return res.status(400).send("Missing required query parameters: type, id, tag")
+    }
+    let imageUrl = `${monobar_endpoint}/Items/${id}/Images/${type}?tag=${tag}`
+    if (type === 'Logo') {
+        imageUrl += '&maxHeight=90'
+    } else if (type === 'Backdrop') {
+        imageUrl += 'maxWidth=1920&maxHeight=1080&quality=30'
+    } else {
+        const maxWidth = req.query.maxWidth || 225
+        const maxHeight = req.query.maxHeight || 338
+        const quality = req.query.quality || 90
+        imageUrl += `&maxWidth=${maxWidth}&maxHeight=${maxHeight}&quality=${quality}`
+    }
+    try {
+        const imageRes = await fetch(imageUrl, {
+            headers: { 'X-Emby-Token': monobar_token }
+        })
+        if (!imageRes.ok) {
+            return res.status(imageRes.status).send("Failed to fetch image from Emby")
+        }
+        res.setHeader('Content-Type', imageRes.headers.get('Content-Type') || 'image/jpeg')
+        const arrayBuffer = await imageRes.arrayBuffer()
+        res.send(Buffer.from(arrayBuffer))
+    } catch (e) {
+        res.status(500).send("Internal Server Error: " + e.message)
     }
 })
 
