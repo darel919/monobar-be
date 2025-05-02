@@ -36,9 +36,8 @@ router.get('/', async(req,res) => {
             return res.status(home.status).send({message: 'Error fetching home', error: home.statusText})
         }
         const data = await home.json()
-        console.log(data)
         const result = []
-        const host = `${req.protocol}://${req.headers.host}`
+        const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `${req.protocol}://${req.headers.host}`
         for (const libraryItem of data.Items) {
             try {
                 const libraryFetch = await fetch(`${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${libraryItem.Id}&Fields=BasicSyncInfo,CanDelete,CanDownload,PrimaryImageAspectRatio,ProductionYear,Status,EndDate,ImageTypeLimit,EnableImageTypes,Backdrop,Thumb&ImageTypeLimit=1&EnableImageTypes=Primary,Backdrop,Thumb&IncludeItemTypes=${libraryItem.CollectionType}`, {
@@ -51,7 +50,7 @@ router.get('/', async(req,res) => {
                     continue
                 }
                 const libraryData = await libraryFetch.json()
-                // Add posterPath to each item using /image endpoint
+
                 if (libraryData.Items) {
                     libraryData.Items.forEach(item => {
                         const tag = item.ImageTags && item.ImageTags.Primary ? item.ImageTags.Primary : ''
@@ -74,7 +73,7 @@ router.get('/', async(req,res) => {
 // Watch Endpoint
 router.get('/watch', async (req, res) => {
     const id = req.query.id
-    const host = `${req.protocol}://${req.headers.host}`
+    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `${req.protocol}://${req.headers.host}`
     const isAdmin = true
     const intent = req.query.intent
     
@@ -99,7 +98,6 @@ router.get('/watch', async (req, res) => {
                 }
         
                 const data = await info.json()
-                // Update ImageTags to use /image endpoint
                 if (data.BackdropImageTags && data.Id) {
                     data.BackdropImageTags = `${host}/monobar/image?type=Backdrop&id=${data.Id}&tag=${data.BackdropImageTags[0]}`
                 }
@@ -170,28 +168,23 @@ router.get('/watch', async (req, res) => {
                                         {
                                             "Condition": "LessThanEqual",
                                             "Property": "VideoLevel",
-                                            "Value": "62",
+                                            "Value": "90", // This level generally supports up to 720p
                                             "IsRequired": false
                                         },
                                         {
                                             "Condition": "LessThanEqual",
                                             "Property": "Width",
-                                            "Value": "854",
+                                            "Value": "1280", // Max width for 720p
+                                            "IsRequired": false
+                                        },
+                                        {
+                                            "Condition": "LessThanEqual",
+                                            "Property": "Height", // Added height condition for 720p
+                                            "Value": "720",
                                             "IsRequired": false
                                         }
                                     ]
                                 },
-                            {
-                                "Type": "Video",
-                                "Conditions": [
-                                {
-                                    "Condition": "LessThanEqual",
-                                    "Property": "Width",
-                                    "Value": "854",
-                                    "IsRequired": false
-                                }
-                                ]
-                            }
                             ],
                             "SubtitleProfiles": [
                                 {
@@ -239,18 +232,30 @@ router.get('/watch', async (req, res) => {
         
                 const data = await info.json()
         
+                let deviceIdFromQuery = null;
+
                 if (data.MediaSources && data.MediaSources.length > 0 && data.MediaSources[0].TranscodingUrl) {
                     const originalUrlString = data.MediaSources[0].TranscodingUrl
+                    
                     try {
                         const originalUrl = new URL(originalUrlString, 'http://dummy')
                         const originalQueryString = originalUrl.search
+                        const params = new URLSearchParams(originalQueryString);
+                        deviceIdFromQuery = params.get('DeviceId'); // Extract DeviceId
                         const newTranscodingUrl = `${host}/monobar/watch/master/playlist${originalQueryString}`
                         data.MediaSources[0].TranscodingUrl = newTranscodingUrl
                     } catch (parseError) {}
                 }
         
                 if(data.MediaSources && data.MediaSources.length > 0 && data.MediaSources[0].TranscodingUrl) {
-                    res.redirect(data.MediaSources[0].TranscodingUrl)
+                    const deviceIdToUse = deviceIdFromQuery || data.DeviceId;
+                    const response = {
+                        playbackUrl: data.MediaSources[0].TranscodingUrl,
+                        playSessionId: data.PlaySessionId,
+                        deviceId: deviceIdToUse, // Use the extracted or fallback DeviceId
+                    }
+                    res.send(response)
+                    // res.redirect(data.MediaSources[0].TranscodingUrl)
                 } else {
                     // res.send(data)
                     res.status(500).send({message: 'Unable to provide playback URL for this title.'})
@@ -265,7 +270,7 @@ router.get('/watch', async (req, res) => {
     
 })
 router.get('/watch/master/playlist', async (req, res) => {
-    const host = `${req.protocol}://${req.headers.host}`
+    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `${req.protocol}://${req.headers.host}`
     const deviceId = req.query.DeviceId
     const mediaSourceId = req.query.MediaSourceId
     const playSessionId = req.query.PlaySessionId
@@ -419,7 +424,7 @@ router.get('/watch/main/playlist', async (req, res) => {
     if (h264Profile !== undefined) queryParams.set('h264-profile', h264Profile)
     if (h264Level !== undefined) queryParams.set('h264-level', h264Level)
     if (transcodeReasons !== undefined) queryParams.set('TranscodeReasons', transcodeReasons)
-    const host = `${req.protocol}://${req.headers.host}`
+    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `${req.protocol}://${req.headers.host}`
     const baseMonobarUrl = `${monobar_endpoint}/videos/${id}`
     const originalM3u8Url = `${baseMonobarUrl}/${filename}?${queryParams.toString()}`
     try {
@@ -471,7 +476,7 @@ router.get('/watch/main/playlist', async (req, res) => {
     }
 })
 router.get('/watch/main/segment/*', async (req, res) => {
-    res.setHeader('Cache-Control', 'public, max-age=120')
+    res.setHeader('Cache-Control', 'public, max-age=3600')
     const segmentPath = req.params[0]
     const videoId = req.query.videoId
     if (!videoId) {
@@ -519,7 +524,32 @@ router.get('/watch/main/segment/*', async (req, res) => {
     }
 })
 
-// /image endpoint to proxy images from Emby
+router.delete('/status', async (req, res) => {
+    const deviceId = req.query.deviceId
+    const playSessionId = req.query.playSessionId
+    if (!deviceId) {
+        return res.status(400).send("Missing 'deviceId' query parameter")
+    }
+    if (!playSessionId) {
+        return res.status(400).send("Missing 'playSessionId' query parameter")
+    }
+    console.log("Received stop playback state for deviceId:", deviceId, "and playSessionId:", playSessionId)
+    try {
+        const status = await fetch(`${monobar_endpoint}/Videos/ActiveEncodings?DeviceId=${deviceId}&PlaySessionId=${playSessionId}`, {
+            method: 'DELETE',
+            headers: {
+                'X-Emby-Token': monobar_token,
+            }, 
+        })
+        if (!status.ok) {
+            return res.status(status.status).send({message: 'Error deleting status', error: status.statusText})
+        }
+        res.send({message: 'Status deleted successfully'})
+    } catch (e) {
+        res.status(500).send("Internal Server Error: " + e.message)
+    }
+})
+
 router.get('/image', async (req, res) => {
     res.setHeader('Cache-Control', 'public, max-age=3600')
     const { type, id, tag } = req.query
