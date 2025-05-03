@@ -25,6 +25,7 @@ router.post('/ping', async (req, res) => {
 
 router.get('/', async(req,res) => {
     res.setHeader('Cache-Control', 'public, max-age=120')
+    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`
     try {
         const home = await fetch(`${monobar_endpoint}/Users/${monobar_user}/Views/?fields=ItemTypes`, {
             headers: {
@@ -37,7 +38,7 @@ router.get('/', async(req,res) => {
         }
         const data = await home.json()
         const result = []
-        const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `${req.protocol}://${req.headers.host}`
+
         for (const libraryItem of data.Items) {
             try {
                 const libraryFetch = await fetch(`${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${libraryItem.Id}&Fields=BasicSyncInfo,CanDelete,CanDownload,PrimaryImageAspectRatio,ProductionYear,Status,EndDate,ImageTypeLimit,EnableImageTypes,Backdrop,Thumb&ImageTypeLimit=1&EnableImageTypes=Primary,Backdrop,Thumb&IncludeItemTypes=${libraryItem.CollectionType}`, {
@@ -57,9 +58,8 @@ router.get('/', async(req,res) => {
                         item.posterPath = `${host}/monobar/image?type=Primary&id=${item.Id}&tag=${tag}`
                     })
                 }
-                // Filter out folders (IsFolder: true)
                 const nonFolderItems = (libraryData.Items || []).filter(item => !item.IsFolder)
-                result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: nonFolderItems })
+                result.push({ ...libraryItem, latest: nonFolderItems })
             } catch (e) {
                 result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: e.message })
             }
@@ -69,11 +69,66 @@ router.get('/', async(req,res) => {
         res.status(500).send("Internal Server Error: " + e.message)
     }
 })
+router.get('/library', async (req, res) => {
+    res.setHeader('Cache-Control', 'public, max-age=120')
+    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`
+    const id = req.query.id 
+    const sortBy = req.query.sortBy
+    const sortOrder = req.query.sortOrder === 'asc' ? 'Ascending' : 'Descending'
+    if(!id) {
+        return res.status(400).send("Missing 'id' query parameter")
+    }
+
+
+    // console.log(req.query)
+    try {
+        let url = `${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${id}&Fields=BasicSyncInfo,ProductionYear,Overview&StartIndex=0&EnableImageTypes=Primary%2CBackdrop%2CThumb&ImageTypeLimit=1&Recursive=true&Filters=IsNotFolder&EnableImageTypes=Primary,Backdrop,Thumb`;
+        if (req.query.sortBy) {
+            url += `&SortBy=${encodeURIComponent(sortBy)}`;
+        }
+        if (req.query.sortOrder) {
+            url += `&SortOrder=${encodeURIComponent(sortOrder)}`;
+        }
+        const library = await fetch(url, {
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Emby-Token': monobar_token,
+            }, 
+        })
+        // console.log(library)
+        if (!library.ok) {
+            return res.status(library.status).send({message: 'Error fetching library', error: library.statusText})
+        }
+        const data = await library.json()
+        if (data && data.Items) {
+            data.Items.forEach(item => {
+                const tag = item.ImageTags.Thumb ? item.ImageTags.Thumb : item.ImageTags.Primary
+                item.thumbPath = `${host}/monobar/image?type=${item.ImageTags.Thumb ? 'thumb' : 'primary'}&id=${item.Id}&tag=${tag}`
+                const Postertag = item.ImageTags && item.ImageTags.Primary ? item.ImageTags.Primary : ''
+                item.posterPath = `${host}/monobar/image?type=Primary&id=${item.Id}&tag=${Postertag}`
+            })
+        }
+        const itemInfo = await fetch(`${monobar_endpoint}/Items?Ids=${id}&IncludeItemTypes=CollectionFolder`, {
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Emby-Token': monobar_token,
+            }, 
+        })
+        // console.log(await itemInfo.json())
+        if (!itemInfo.ok) {
+            return res.status(itemInfo.status).send({message: 'Error fetching library', error: itemInfo.statusText})
+        }
+        const libraryInfoData = await itemInfo.json()
+        res.send({library: libraryInfoData.Items[0], content: data.Items})
+    } catch (e) {
+        res.status(500).send("Internal Server Error: " + e.message)
+    }
+})
 
 // Watch Endpoint
 router.get('/watch', async (req, res) => {
     const id = req.query.id
-    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `${req.protocol}://${req.headers.host}`
+    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`
     const isAdmin = true
     const intent = req.query.intent
     
@@ -109,6 +164,8 @@ router.get('/watch', async (req, res) => {
                     data.ImageTags = newImageTags
                 }
                 const playUrl = `${host}/monobar/watch?intent=play&id=${id}`
+                console.log("Sending host: "+ host)
+                console.log(req.headers['x-environment'])
                 const result = {...data, playUrl}
                 
                 res.send(result)
@@ -270,7 +327,7 @@ router.get('/watch', async (req, res) => {
     
 })
 router.get('/watch/master/playlist', async (req, res) => {
-    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `${req.protocol}://${req.headers.host}`
+    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`
     const deviceId = req.query.DeviceId
     const mediaSourceId = req.query.MediaSourceId
     const playSessionId = req.query.PlaySessionId
@@ -363,6 +420,7 @@ router.get('/watch/master/playlist', async (req, res) => {
                 newMainParams.set('id', id)
                 newMainParams.set('filename', 'main.m3u8')
                 const newMainUrl = `${host}/monobar/watch/main/playlist?${newMainParams.toString()}`
+                console.log("Current mode: "+req.headers['x-environment']+" New main URL: " + newMainUrl)
                 return newMainUrl
             }
             return line
@@ -375,6 +433,7 @@ router.get('/watch/master/playlist', async (req, res) => {
     }
 })
 router.get('/watch/main/playlist', async (req, res) => {
+    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`
     const deviceId = req.query.DeviceId
     const mediaSourceId = req.query.MediaSourceId
     const playSessionId = req.query.PlaySessionId
@@ -424,7 +483,7 @@ router.get('/watch/main/playlist', async (req, res) => {
     if (h264Profile !== undefined) queryParams.set('h264-profile', h264Profile)
     if (h264Level !== undefined) queryParams.set('h264-level', h264Level)
     if (transcodeReasons !== undefined) queryParams.set('TranscodeReasons', transcodeReasons)
-    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `${req.protocol}://${req.headers.host}`
+
     const baseMonobarUrl = `${monobar_endpoint}/videos/${id}`
     const originalM3u8Url = `${baseMonobarUrl}/${filename}?${queryParams.toString()}`
     try {
@@ -561,6 +620,8 @@ router.get('/image', async (req, res) => {
         imageUrl += '&maxHeight=90'
     } else if (type === 'Backdrop') {
         imageUrl += 'maxWidth=1920&maxHeight=1080&quality=30'
+    } else if (type === 'Thumb' || type === 'thumb') {
+        imageUrl += 'maxWidth=640&maxHeight=360&quality=90'
     } else {
         const maxWidth = req.query.maxWidth || 225
         const maxHeight = req.query.maxHeight || 338
