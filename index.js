@@ -28,21 +28,21 @@ async function stopEmbyTranscode(deviceId, playSessionId) {
     } catch (e) {}
 }
 
-setInterval(async () => {
-    const now = Date.now();
-    for (const [sessionKey, session] of playSessionCache.entries()) {
-        if (now - session.lastAccessed > 10 * 60 * 1000) {
-            if (session.embySessionIds) {
-                for (const playSessionId of Object.values(session.embySessionIds)) {
-                    try {
-                        await stopEmbyTranscode(session.deviceId, playSessionId);
-                    } catch (e) {}
-                }
-            }
-            playSessionCache.delete(sessionKey);
-        }
-    }
-}, 5 * 60 * 1000);
+// setInterval(async () => {
+//     const now = Date.now();
+//     for (const [sessionKey, session] of playSessionCache.entries()) {
+//         if (now - session.lastAccessed > 10 * 60 * 1000) {
+//             if (session.embySessionIds) {
+//                 for (const playSessionId of Object.values(session.embySessionIds)) {
+//                     try {
+//                         await stopEmbyTranscode(session.deviceId, playSessionId);
+//                     } catch (e) {}
+//                 }
+//             }
+//             playSessionCache.delete(sessionKey);
+//         }
+//     }
+// }, 5 * 60 * 1000);
 
 router.use((req, res, next) => {
     if (req.headers['x-environment'] === 'development') {
@@ -573,6 +573,7 @@ router.get('/watch/main/segment/*', async (req, res) => {
             res.end();
         }
     } catch (e) {
+        console.error("Error fetching segment:", e);
         if (!res.headersSent) {
             res.status(500).send("Internal Server Error");
         } else {
