@@ -7,6 +7,16 @@ const monobar_endpoint = process.env.MONOBAR_BACKEND
 const monobar_token = process.env.MONOBAR_TOKEN
 const monobar_user =  process.env.MONOBAR_USER
 
+// Disable caching in development environment
+router.use((req, res, next) => {
+    if (req.headers['x-environment'] === 'development') {
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+    }
+    next();
+});
+
 router.get('/ping', async (req, res) => {
     if(!req.headers['x-real-ip']) {
         return res.status(400).send("Missing x-real-ip header")
@@ -27,39 +37,52 @@ router.get('/', async(req,res) => {
     res.setHeader('Cache-Control', 'public, max-age=120')
     const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`
     try {
-        const home = await fetch(`${monobar_endpoint}/Users/${monobar_user}/Views/?fields=ItemTypes`, {
+        const home = await fetch(`${monobar_endpoint}/Users/${monobar_user}/Views?fields=ItemTypes`, {
             headers: {
                 'Content-Type': 'application/json',
                 'X-Emby-Token': monobar_token,
             }, 
         })
+       
         if (!home.ok) {
             return res.status(home.status).send({message: 'Error fetching home', error: home.statusText})
         }
         const data = await home.json()
+        // console.log(data)
         const result = []
+
 
         for (const libraryItem of data.Items) {
             try {
-                const libraryFetch = await fetch(`${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${libraryItem.Id}&Fields=BasicSyncInfo,CanDelete,CanDownload,PrimaryImageAspectRatio,ProductionYear,Status,EndDate,ImageTypeLimit,EnableImageTypes,Backdrop,Thumb&ImageTypeLimit=1&EnableImageTypes=Primary,Backdrop,Thumb&IncludeItemTypes=${libraryItem.CollectionType}`, {
+                // console.log(libraryItem.CollectionType)
+                const libraryFetch = await fetch(`
+${monobar_endpoint}/Users/${monobar_user}/Items?IncludeItemTypes=Movie&Fields=BasicSyncInfo&ProductionYear&Status&EndDate&StartIndex=0&SortBy=CommunityRating&SortName&SortOrder=Ascending&ParentId=${libraryItem.Id}&EnableImageTypes=Primary&Backdrop&Thumb&Recursive=true&Limit=10&EnableImageTypes=Primary,Backdrop,Thumb`, {
                     headers: {
                         'X-Emby-Token': monobar_token,
                     }, 
                 })
+                // console.log(libraryFetch.url)
                 if (!libraryFetch.ok) {
                     result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: libraryFetch.statusText })
                     continue
                 }
                 const libraryData = await libraryFetch.json()
+                // console.log(libraryData)
 
                 if (libraryData.Items) {
                     libraryData.Items.forEach(item => {
-                        const tag = item.ImageTags && item.ImageTags.Primary ? item.ImageTags.Primary : ''
-                        item.posterPath = `${host}/monobar/image?type=Primary&id=${item.Id}&tag=${tag}`
+                        if (item.ImageTags && item.ImageTags.Primary) {
+                            const tag = item.ImageTags.Primary
+                            item.posterPath = `${host}/monobar/image?type=Primary&id=${item.Id}&tag=${tag}`
+                        } else if (item.ImageTags && item.ImageTags.Primary) {
+                            const tag = item.ImageTags.Primary
+                            item.posterPath = `${host}/monobar/image?type=Primary&id=${item.Id}&tag=${tag}`
+                        } else {
+                            item.posterPath = null // or set to a default image path if you prefer
+                        }
                     })
                 }
-                const nonFolderItems = (libraryData.Items || []).filter(item => !item.IsFolder)
-                result.push({ ...libraryItem, latest: nonFolderItems })
+                result.push({ ...libraryItem, latest: libraryData.Items })
             } catch (e) {
                 result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: e.message })
             }
@@ -82,7 +105,7 @@ router.get('/library', async (req, res) => {
 
     // console.log(req.query)
     try {
-        let url = `${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${id}&Fields=BasicSyncInfo,ProductionYear,Overview&StartIndex=0&EnableImageTypes=Primary%2CBackdrop%2CThumb&ImageTypeLimit=1&Recursive=true&Filters=IsNotFolder&EnableImageTypes=Primary,Backdrop,Thumb`;
+        let url = `${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${id}&Fields=BasicSyncInfo,ProductionYear,Overview&StartIndex=0&EnableImageTypes=Primary&Backdrop&Thumb&ImageTypeLimit=1&Recursive=true&Filters=IsNotFolder&EnableImageTypes=Primary,Backdrop,Thumb`;
         if (req.query.sortBy) {
             url += `&SortBy=${encodeURIComponent(sortBy)}`;
         }
@@ -102,11 +125,25 @@ router.get('/library', async (req, res) => {
         const data = await library.json()
         if (data && data.Items) {
             data.Items.forEach(item => {
-                const tag = item.ImageTags.Thumb ? item.ImageTags.Thumb : item.ImageTags.Primary
-                item.thumbPath = `${host}/monobar/image?type=${item.ImageTags.Thumb ? 'thumb' : 'primary'}&id=${item.Id}&tag=${tag}`
-                const Postertag = item.ImageTags && item.ImageTags.Primary ? item.ImageTags.Primary : ''
-                item.posterPath = `${host}/monobar/image?type=Primary&id=${item.Id}&tag=${Postertag}`
-            })
+            let tag = null;
+            let thumbType = null;
+            if (item.ImageTags) {
+                if (item.ImageTags.Thumb) {
+                tag = item.ImageTags.Thumb;
+                thumbType = 'thumb';
+                } else if (item.ImageTags.Primary) {
+                tag = item.ImageTags.Primary;
+                thumbType = 'primary';
+                }
+            }
+            item.thumbPath = (tag && thumbType && item.Id)
+                ? `${host}/monobar/image?type=${thumbType}&id=${item.Id}&tag=${tag}`
+                : '';
+            const posterTag = (item.ImageTags && item.ImageTags.Primary) ? item.ImageTags.Primary : '';
+            item.posterPath = (posterTag && item.Id)
+                ? `${host}/monobar/image?type=Primary&id=${item.Id}&tag=${posterTag}`
+                : '';
+            });
         }
         const itemInfo = await fetch(`${monobar_endpoint}/Items?Ids=${id}&IncludeItemTypes=CollectionFolder`, {
             headers: {
@@ -125,11 +162,44 @@ router.get('/library', async (req, res) => {
     }
 })
 
+// Helper function to get item info
+async function getItemInfo({ id, host }) {
+    try {
+        const info = await fetch(`${monobar_endpoint}/Users/${monobar_user}/Items/${id}/?fields=ShareLevel`, {
+            method: 'GET',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Emby-Token': monobar_token,
+            },
+        })
+        if (!info.ok) {
+            throw new Error(`Error fetching item info: ${info.statusText}`)
+        }
+        const data = await info.json()
+        if (data.BackdropImageTags && data.Id && Array.isArray(data.BackdropImageTags) && data.BackdropImageTags[0]) {
+            data.BackdropImageTags = `${host}/monobar/image?type=Backdrop&id=${data.Id}&tag=${data.BackdropImageTags[0]}`
+        } else if (data.BackdropImageTags) {
+            data.BackdropImageTags = null
+        }
+        if (data.ImageTags && data.Id) {
+            const newImageTags = {}
+            for (const [type, tag] of Object.entries(data.ImageTags)) {
+                newImageTags[type] = `${host}/monobar/image?type=${type}&id=${data.Id}&tag=${tag}`
+            }
+            data.ImageTags = newImageTags
+        }
+        const playUrl = `${host}/monobar/watch?intent=play&id=${id}`
+        return { ...data, playUrl }
+    } catch (e) {
+        throw e
+    }
+}
+
 // Watch Endpoint
 router.get('/watch', async (req, res) => {
     const id = req.query.id
     const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`
-    const isAdmin = true
+    const isAdmin = req.headers['x-environment'] === 'development' ? true : false
     const intent = req.query.intent
     
     if (!id) {
@@ -140,42 +210,17 @@ router.get('/watch', async (req, res) => {
     } else {
         if(intent == 'info') {
             try {
-                const info = await fetch(`${monobar_endpoint}/Users/${monobar_user}/Items/${id}/?fields=ShareLevel`, {
-                    method: 'GET',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-Emby-Token': monobar_token,
-                    }, 
-                })
-        
-                if (!info.ok) {
-                    return res.status(info.status).send({message: 'Error fetching item info', error: info.statusText})
-                }
-        
-                const data = await info.json()
-                if (data.BackdropImageTags && data.Id) {
-                    data.BackdropImageTags = `${host}/monobar/image?type=Backdrop&id=${data.Id}&tag=${data.BackdropImageTags[0]}`
-                }
-                if (data.ImageTags && data.Id) {
-                    const newImageTags = {}
-                    for (const [type, tag] of Object.entries(data.ImageTags)) {
-                        newImageTags[type] = `${host}/monobar/image?type=${type}&id=${data.Id}&tag=${tag}`
-                    }
-                    data.ImageTags = newImageTags
-                }
-                const playUrl = `${host}/monobar/watch?intent=play&id=${id}`
-                console.log("Sending host: "+ host)
-                console.log(req.headers['x-environment'])
-                const result = {...data, playUrl}
-                
+                const result = await getItemInfo({ id, host })
                 res.send(result)
-                
             } catch (e) {
                 res.status(500).send("Internal Server Error: " + e.message)
             }
         } else if(intent == 'play') {
             try {
-                const info = await fetch(`${monobar_endpoint}/Items/${id}/PlaybackInfo?UserId=${monobar_user}&StartTimeTicks=0&IsPlayback=true&AutoOpenLiveStream=true&reqformat=json`, {
+                // First get info
+                const infoData = await getItemInfo({ id, host })
+                // Then get playback info
+                const watchData = await fetch(`${monobar_endpoint}/Items/${id}/PlaybackInfo?UserId=${monobar_user}&StartTimeTicks=0&IsPlayback=true&AutoOpenLiveStream=true&reqformat=json`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -282,12 +327,12 @@ router.get('/watch', async (req, res) => {
                     })
                 })
         
-                if (!info.ok) {
-                    const errorBody = await info()
-                    return res.status(info.status).send(`Error fetching playback info: ${errorBody}`)
+                if (!watchData.ok) {
+                    const errorBody = await watchData.text()
+                    return res.status(watchData.status).send(`Error fetching playback info: ${errorBody}`)
                 }
         
-                const data = await info.json()
+                const data = await watchData.json()
         
                 let deviceIdFromQuery = null;
 
@@ -306,7 +351,38 @@ router.get('/watch', async (req, res) => {
         
                 if(data.MediaSources && data.MediaSources.length > 0 && data.MediaSources[0].TranscodingUrl) {
                     const deviceIdToUse = deviceIdFromQuery || data.DeviceId;
+                    let subtitlesArr = []
+                    try {
+                        const mediaSourceId = data.MediaSources[0].Id;
+                        for (let subitem of data.MediaSources[0].MediaStreams) {
+                            if(subitem.IsTextSubtitleStream) {
+                                const subtitleUrl = `${host}/monobar/watch/subtitle?subIndex=${subitem.Index}&itemId=${id}&mediaSourceId=${mediaSourceId}&format=vtt`;
+                                if(subitem.Index === 0) {
+                                    subtitlesArr.push({
+                                        default: true,
+                                        url: subtitleUrl,
+                                        html: subitem.DisplayTitle,
+                                        name: subitem.DisplayTitle,
+                                        format: 'vtt',
+                                        index: subitem.Index
+                                    })
+                                } else {
+                                    subtitlesArr.push({
+                                        url: subtitleUrl,
+                                        html: subitem.DisplayTitle,
+                                        name: subitem.DisplayTitle,
+                                        format: 'vtt',
+                                        index: subitem.Index
+                                    })
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        console.error("Error processing subtitles: ", e)
+                    }
                     const response = {
+                        ...infoData,
+                        subtitles: subtitlesArr,
                         playbackUrl: data.MediaSources[0].TranscodingUrl,
                         playSessionId: data.PlaySessionId,
                         deviceId: deviceIdToUse, // Use the extracted or fallback DeviceId
@@ -314,7 +390,6 @@ router.get('/watch', async (req, res) => {
                     res.send(response)
                     // res.redirect(data.MediaSources[0].TranscodingUrl)
                 } else {
-                    // res.send(data)
                     res.status(500).send({message: 'Unable to provide playback URL for this title.'})
                 }
             } catch (e) {
@@ -336,11 +411,13 @@ router.get('/watch/master/playlist', async (req, res) => {
     const audioCodec = req.query.AudioCodec
     const videoBitrate = req.query.VideoBitrate
     const audioBitrate = req.query.AudioBitrate
-    const maxWidth = req.query.MaxWidth
+    const videoStreamIndex = req.query.VideoStreamIndex
     const audioStreamIndex = req.query.AudioStreamIndex
+    const maxAudioChannels = req.query.MaxAudioChannels
+    const transcodingMaxAudioChannels = req.query.TranscodingMaxAudioChannels
+    const maxWidth = req.query.MaxWidth
     const subtitleStreamIndex = req.query.SubtitleStreamIndex
     const subtitleMethod = req.query.SubtitleMethod
-    const transcodingMaxAudioChannels = req.query.TranscodingMaxAudioChannels
     const segmentContainer = req.query.SegmentContainer
     const minSegments = req.query.MinSegments
     const breakOnNonKeyFrames = req.query.BreakOnNonKeyFrames
@@ -349,6 +426,7 @@ router.get('/watch/master/playlist', async (req, res) => {
     const h264Profile = req.query['h264-profile']
     const h264Level = req.query['h264-level']
     const transcodeReasons = req.query.TranscodeReasons
+
     const id = mediaSourceId
     const filename = 'master.m3u8'
     if (!id) {
@@ -364,11 +442,12 @@ router.get('/watch/master/playlist', async (req, res) => {
     if (audioCodec !== undefined) queryParams.set('AudioCodec', audioCodec)
     if (videoBitrate !== undefined) queryParams.set('VideoBitrate', videoBitrate)
     if (audioBitrate !== undefined) queryParams.set('AudioBitrate', audioBitrate)
+    if (maxAudioChannels !== undefined) queryParams.set('MaxAudioChannels', maxAudioChannels)
+    if (transcodingMaxAudioChannels !== undefined) queryParams.set('TranscodingMaxAudioChannels', transcodingMaxAudioChannels)
     if (maxWidth !== undefined) queryParams.set('MaxWidth', maxWidth)
     if (audioStreamIndex !== undefined) queryParams.set('AudioStreamIndex', audioStreamIndex)
     if (subtitleStreamIndex !== undefined) queryParams.set('SubtitleStreamIndex', subtitleStreamIndex)
     if (subtitleMethod !== undefined) queryParams.set('SubtitleMethod', subtitleMethod)
-    if (transcodingMaxAudioChannels !== undefined) queryParams.set('TranscodingMaxAudioChannels', transcodingMaxAudioChannels)
     if (segmentContainer !== undefined) queryParams.set('SegmentContainer', segmentContainer)
     if (minSegments !== undefined) queryParams.set('MinSegments', minSegments)
     if (breakOnNonKeyFrames !== undefined) queryParams.set('BreakOnNonKeyFrames', breakOnNonKeyFrames)
@@ -377,6 +456,7 @@ router.get('/watch/master/playlist', async (req, res) => {
     if (h264Profile !== undefined) queryParams.set('h264-profile', h264Profile)
     if (h264Level !== undefined) queryParams.set('h264-level', h264Level)
     if (transcodeReasons !== undefined) queryParams.set('TranscodeReasons', transcodeReasons)
+    if (videoStreamIndex !== undefined) queryParams.set('VideoStreamIndex', videoStreamIndex)
     const originalMasterUrl = `${monobar_endpoint}/videos/${id}/${filename}?${queryParams.toString()}`
     try {
         const masterResponse = await fetch(originalMasterUrl)
@@ -420,7 +500,7 @@ router.get('/watch/master/playlist', async (req, res) => {
                 newMainParams.set('id', id)
                 newMainParams.set('filename', 'main.m3u8')
                 const newMainUrl = `${host}/monobar/watch/main/playlist?${newMainParams.toString()}`
-                console.log("Current mode: "+req.headers['x-environment']+" New main URL: " + newMainUrl)
+                // console.log("Current mode: "+req.headers['x-environment']+" New main URL: " + newMainUrl)
                 return newMainUrl
             }
             return line
@@ -582,6 +662,34 @@ router.get('/watch/main/segment/*', async (req, res) => {
         }
     }
 })
+router.get('/watch/subtitle', async (req, res) => {
+    const subIndex = req.query.subIndex
+    const itemId = req.query.itemId
+    const mediaSourceId = req.query.mediaSourceId
+    const format = req.query.format || "vtt"
+
+    if (!subIndex || !itemId || !mediaSourceId || !format) {
+        return res.status(400).send("Missing 'subIndex', 'itemId', 'mediaSourceId', or 'format' query parameter")
+    }
+    const subtitleUrl = `${monobar_endpoint}/Items/${itemId}/${mediaSourceId}/Subtitles/${subIndex}/Stream.${format}`
+    try {
+        const subtitleResponse = await fetch(subtitleUrl, {
+            headers: {
+                'X-Emby-Token': monobar_token,
+            }, 
+        })
+        if (!subtitleResponse.ok) {
+            return res.status(subtitleResponse.status).send({message: 'Error fetching subtitle', error: subtitleResponse.statusText})
+        }
+        const subtitleData = await subtitleResponse.text()
+        res.setHeader('Content-Type', 'text/vtt')
+        res.send(subtitleData)
+    }
+    catch (e) {
+        console.error("Error fetching subtitle: ", e)
+        res.status(500).send("Internal Server Error: " + e.message)
+    }
+})
 
 router.delete('/status', async (req, res) => {
     const deviceId = req.query.deviceId
@@ -612,8 +720,8 @@ router.delete('/status', async (req, res) => {
 router.get('/image', async (req, res) => {
     res.setHeader('Cache-Control', 'public, max-age=3600')
     const { type, id, tag } = req.query
-    if (!type || !id || !tag) {
-        return res.status(400).send("Missing required query parameters: type, id, tag")
+    if (!type || !id || !tag || type === 'undefined' || id === 'undefined' || tag === 'undefined' || type === null || id === null || tag === null) {
+        return res.status(400).send("Missing or invalid required query parameters: type, id, tag")
     }
     let imageUrl = `${monobar_endpoint}/Items/${id}/Images/${type}?tag=${tag}`
     if (type === 'Logo') {
