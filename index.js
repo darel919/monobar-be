@@ -34,7 +34,7 @@ router.post('/ping', async (req, res) => {
 
 
 router.get('/', async(req,res) => {
-    res.setHeader('Cache-Control', 'public, max-age=120')
+    res.setHeader('Cache-Control', 'public, max-age=720')
     const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`
     try {
         const home = await fetch(`${monobar_endpoint}/Users/${monobar_user}/Views?fields=ItemTypes`, {
@@ -56,7 +56,7 @@ router.get('/', async(req,res) => {
             try {
                 // console.log(libraryItem.CollectionType)
                 const libraryFetch = await fetch(`
-${monobar_endpoint}/Users/${monobar_user}/Items?IncludeItemTypes=Movie&Fields=BasicSyncInfo&ProductionYear&Status&EndDate&StartIndex=0&SortBy=CommunityRating&SortName&SortOrder=Ascending&ParentId=${libraryItem.Id}&EnableImageTypes=Primary&Backdrop&Thumb&Recursive=true&Limit=10&EnableImageTypes=Primary,Backdrop,Thumb`, {
+${monobar_endpoint}/Users/${monobar_user}/Items?IncludeItemTypes=Movie&Fields=BasicSyncInfo&ProductionYear&Status&EndDate&StartIndex=0&SortBy=DateCreated&SortName&SortOrder=Descending&ParentId=${libraryItem.Id}&EnableImageTypes=Primary&Backdrop&Thumb&Recursive=true&Limit=10&EnableImageTypes=Primary,Backdrop,Thumb`, {
                     headers: {
                         'X-Emby-Token': monobar_token,
                     }, 
@@ -93,7 +93,7 @@ ${monobar_endpoint}/Users/${monobar_user}/Items?IncludeItemTypes=Movie&Fields=Ba
     }
 })
 router.get('/library', async (req, res) => {
-    res.setHeader('Cache-Control', 'public, max-age=120')
+    res.setHeader('Cache-Control', 'public, max-age=720')
     const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`
     const id = req.query.id 
     const sortBy = req.query.sortBy
@@ -102,8 +102,6 @@ router.get('/library', async (req, res) => {
         return res.status(400).send("Missing 'id' query parameter")
     }
 
-
-    // console.log(req.query)
     try {
         let url = `${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${id}&Fields=BasicSyncInfo,ProductionYear,Overview&StartIndex=0&EnableImageTypes=Primary&Backdrop&Thumb&ImageTypeLimit=1&Recursive=true&Filters=IsNotFolder&EnableImageTypes=Primary,Backdrop,Thumb`;
         if (req.query.sortBy) {
@@ -162,7 +160,6 @@ router.get('/library', async (req, res) => {
     }
 })
 
-// Helper function to get item info
 async function getItemInfo({ id, host }) {
     try {
         const info = await fetch(`${monobar_endpoint}/Users/${monobar_user}/Items/${id}/?fields=ShareLevel`, {
@@ -178,7 +175,9 @@ async function getItemInfo({ id, host }) {
         const data = await info.json()
         if (data.BackdropImageTags && data.Id && Array.isArray(data.BackdropImageTags) && data.BackdropImageTags[0]) {
             data.BackdropImageTags = `${host}/monobar/image?type=Backdrop&id=${data.Id}&tag=${data.BackdropImageTags[0]}`
-        } else if (data.BackdropImageTags) {
+        } else if (data.ImageTags.Primary) {
+            data.BackdropImageTags = `${host}/monobar/image?type=Primary&id=${data.Id}&tag=${data.ImageTags.Primary}&maxWidth=1920&maxHeight=1080`
+        } else {
             data.BackdropImageTags = null
         }
         if (data.ImageTags && data.Id) {
@@ -663,6 +662,7 @@ router.get('/watch/main/segment/*', async (req, res) => {
     }
 })
 router.get('/watch/subtitle', async (req, res) => {
+    res.setHeader('Cache-Control', 'public, max-age=3600')
     const subIndex = req.query.subIndex
     const itemId = req.query.itemId
     const mediaSourceId = req.query.mediaSourceId
@@ -718,7 +718,7 @@ router.delete('/status', async (req, res) => {
 })
 
 router.get('/image', async (req, res) => {
-    res.setHeader('Cache-Control', 'public, max-age=3600')
+    res.setHeader('Cache-Control', 'public, max-age=604800')
     const { type, id, tag } = req.query
     if (!type || !id || !tag || type === 'undefined' || id === 'undefined' || tag === 'undefined' || type === null || id === null || tag === null) {
         return res.status(400).send("Missing or invalid required query parameters: type, id, tag")
