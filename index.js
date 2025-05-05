@@ -82,6 +82,38 @@ async function fetchLibraryItems({ parentId, host, sortBy, sortOrder, limit }) {
     }
 }
 
+async function extractBandwidthFromMasterPlaylist(data) {
+    // console.log(data)
+    if (!data?.MediaSources[0]?.TranscodingUrl) return null;
+    const url = new URL(data.MediaSources[0].TranscodingUrl, monobar_endpoint);
+    console.log(url)
+    const urlPath = url.pathname.replace(/\/[^/]+$/, '/master.m3u8');
+    const masterUrl = `${monobar_endpoint}${urlPath}?${url.searchParams.toString()}`;
+// console.log(masterUrl)
+    try {
+        const response = await fetch(masterUrl, {
+            headers: { 'X-Emby-Token': monobar_token }
+        });
+        if (!response.ok) {
+            console.error('Unable to fetch master playlist for bandwidth data:', response.statusText);
+            return null
+        };
+        
+        const content = await response.text();
+        const lines = content.split('\n');
+        console.log(content)
+        for (const line of lines) {
+            if (line.includes('BANDWIDTH=')) {
+                const bandwidthMatch = line.match(/BANDWIDTH=(\d+)/);
+                if (bandwidthMatch) return parseInt(bandwidthMatch[1]);
+            }
+        }
+    } catch (e) {
+        console.error('Error fetching master playlist:', e);
+    }
+    return null;
+}
+
 router.use((req, res, next) => {
     if (req.headers['x-environment'] === 'development') {
         res.setHeader('Cache-Control', 'no-store');
@@ -274,7 +306,7 @@ async function getEmbyPlaybackInfo({ id, maxWidth, maxHeight, maxBitrate, label,
                         "MaxAudioChannels": "6",
                         "MinSegments": "1",
                         "BreakOnNonKeyFrames": true,
-                        "ManifestSubtitles": "vtt"
+                        // "ManifestSubtitles": "vtt"
                     }
                 ],
                 "CodecProfiles": [
@@ -293,9 +325,23 @@ async function getEmbyPlaybackInfo({ id, maxWidth, maxHeight, maxBitrate, label,
     });
     if (!playbackInfoRes.ok) return null;
     const playbackInfo = await playbackInfoRes.json();
+    const actualBandwidth = await extractBandwidthFromMasterPlaylist(playbackInfo);
+    if(!actualBandwidth) return null;
+    if (!playbackInfo.MediaSources || !playbackInfo.MediaSources[0]) return null;
     const ms = playbackInfo.MediaSources && playbackInfo.MediaSources[0];
     if (!ms || !ms.TranscodingUrl) return null;
-    return { ms, label, maxWidth, maxHeight, maxBitrate, playSessionId: playbackInfo.PlaySessionId };
+    
+
+    
+    return { 
+        ms, 
+        label, 
+        maxWidth, 
+        maxHeight, 
+        maxBitrate, 
+        playSessionId: playbackInfo.PlaySessionId, 
+        actualBandwidth 
+    };
 }
 
 router.get('/watch', async (req, res) => {
@@ -404,7 +450,7 @@ router.get('/watch/master/playlist', async (req, res) => {
     }
     try {
         const itemInfo = await getItemInfo({ id, host });
-        console.log("Item Info:", itemInfo);
+        // console.log("Item Info:", itemInfo);
         const width = itemInfo.Width || (itemInfo.MediaStreams && itemInfo.MediaStreams.find(s => s.Type === 'Video')?.Width);
         const height = itemInfo.Height || (itemInfo.MediaStreams && itemInfo.MediaStreams.find(s => s.Type === 'Video')?.Height);
         const allQualities = [
@@ -427,8 +473,9 @@ router.get('/watch/master/playlist', async (req, res) => {
         if (allowedQualities.length === 0) {
             allowedQualities.push(allQualities[0]);
         }
-        console.log("Allowed qualities:", allowedQualities);
+        // console.log("Allowed qualities:", allowedQualities);
         const variantInfos = [];
+        
         for (const q of allowedQualities) {
             const info = await getEmbyPlaybackInfo({ id, ...q, genSessionId });
             if (!info) continue;
@@ -455,12 +502,13 @@ router.get('/watch/master/playlist', async (req, res) => {
             const params = urlObj ? urlObj.searchParams : new URLSearchParams();
             params.set('PlaySessionId', newPlaySessionId);
             const variantUrl = `${host}/monobar/watch/main/playlist?id=${id}&${params.toString()}&label=${q.label}&DeviceId=${session.deviceId}`;
-            const bandwidth = info.ms.Bitrate || q.maxBitrate;
-            const resolution = `${q.maxWidth}x${q.maxHeight}`;
+            
+            const bandwidth = info.actualBandwidth;
+            
             variantInfos.push({
                 url: variantUrl,
                 bandwidth,
-                resolution,
+                resolution: `${q.maxWidth}x${q.maxHeight}`,
                 label: q.label
             });
         }
