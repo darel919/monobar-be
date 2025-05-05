@@ -28,21 +28,59 @@ async function stopEmbyTranscode(deviceId, playSessionId) {
     } catch (e) {}
 }
 
-// setInterval(async () => {
-//     const now = Date.now();
-//     for (const [sessionKey, session] of playSessionCache.entries()) {
-//         if (now - session.lastAccessed > 10 * 60 * 1000) {
-//             if (session.embySessionIds) {
-//                 for (const playSessionId of Object.values(session.embySessionIds)) {
-//                     try {
-//                         await stopEmbyTranscode(session.deviceId, playSessionId);
-//                     } catch (e) {}
-//                 }
-//             }
-//             playSessionCache.delete(sessionKey);
-//         }
-//     }
-// }, 5 * 60 * 1000);
+async function fetchLibraryItems({ parentId, host, sortBy, sortOrder, limit }) {
+    // console.log(limit)
+    let url = `${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${parentId}&Fields=BasicSyncInfo,ProductionYear,Overview&StartIndex=0&Recursive=true&Filters=IsNotFolder&IncludeImageTypes=Logo`;
+    if (sortBy) {
+        url += `&SortBy=${encodeURIComponent(sortBy)}`;
+    }
+    if (sortOrder) {
+        url += `&SortOrder=${encodeURIComponent(sortOrder)}`;
+    }
+    if (limit) {
+        url += `&Limit=${encodeURIComponent(limit)}`;
+    }
+    try {
+        const library = await fetch(url, {
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Emby-Token': monobar_token,
+            },
+        });
+        if (!library.ok) {
+            return { error: { message: 'Error fetching library', status: library.status, statusText: library.statusText }, items: [] };
+        }
+        const data = await library.json();
+        if (data && data.Items) {
+            data.Items.forEach(item => {
+                let tag = null;
+                let thumbType = null;
+                if (item.ImageTags) {
+                    if (item.ImageTags.Thumb) {
+                        tag = item.ImageTags.Thumb;
+                        thumbType = 'thumb';
+                    } else if (item.ImageTags.Backdrop) {
+                        tag = item.ImageTags.Backdrop;
+                        thumbType = 'Backdrop';
+                    } else if (item.ImageTags.Primary) {
+                        tag = item.ImageTags.Primary;
+                        thumbType = 'Primary';
+                    }
+                }
+                item.thumbPath = (tag && thumbType && item.Id)
+                    ? `${host}/monobar/image?type=${thumbType}&id=${item.Id}&tag=${tag}`
+                    : '';
+                const posterTag = (item.ImageTags && item.ImageTags.Primary) ? item.ImageTags.Primary : '';
+                item.posterPath = (posterTag && item.Id)
+                    ? `${host}/monobar/image?type=Primary&id=${item.Id}&tag=${posterTag}`
+                    : '';
+            });
+        }
+        return { items: data.Items || [], error: null };
+    } catch (e) {
+        return { error: { message: e.message }, items: [] };
+    }
+}
 
 router.use((req, res, next) => {
     if (req.headers['x-environment'] === 'development') {
@@ -72,6 +110,9 @@ router.post('/ping', async (req, res) => {
 router.get('/', async (req, res) => {
     res.setHeader('Cache-Control', 'public, max-age=720');
     const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
+    const sortBy = req.query.sortBy || 'DateCreated&SortName';
+    const sortOrder = req.query.sortOrder || 'Descending';
+    const limit = 10;
     try {
         const home = await fetch(`${monobar_endpoint}/Users/${monobar_user}/Views?fields=ItemTypes`, {
             headers: {
@@ -86,30 +127,12 @@ router.get('/', async (req, res) => {
         const result = [];
         for (const libraryItem of data.Items) {
             try {
-                const libraryFetch = await fetch(`${monobar_endpoint}/Users/${monobar_user}/Items?IncludeItemTypes=Movie&Fields=BasicSyncInfo&ProductionYear&Status&EndDate&StartIndex=0&SortBy=DateCreated&SortName&SortOrder=Descending&ParentId=${libraryItem.Id}&EnableImageTypes=Primary&Backdrop&Thumb&Recursive=true&Limit=10&EnableImageTypes=Primary,Backdrop,Thumb`, {
-                    headers: {
-                        'X-Emby-Token': monobar_token,
-                    },
-                });
-                if (!libraryFetch.ok) {
-                    result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: libraryFetch.statusText });
+                const { items, error } = await fetchLibraryItems({ parentId: libraryItem.Id, host, sortBy, sortOrder, limit });
+                if (error) {
+                    result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: error.statusText || error.message });
                     continue;
                 }
-                const libraryData = await libraryFetch.json();
-                if (libraryData.Items) {
-                    libraryData.Items.forEach(item => {
-                        if (item.ImageTags && item.ImageTags.Primary) {
-                            const tag = item.ImageTags.Primary;
-                            item.posterPath = `${host}/monobar/image?type=Primary&id=${item.Id}&tag=${tag}`;
-                        } else if (item.ImageTags && item.ImageTags.Primary) {
-                            const tag = item.ImageTags.Primary;
-                            item.posterPath = `${host}/monobar/image?type=Primary&id=${item.Id}&tag=${tag}`;
-                        } else {
-                            item.posterPath = null;
-                        }
-                    });
-                }
-                result.push({ ...libraryItem, latest: libraryData.Items });
+                result.push({ ...libraryItem, latest: items });
             } catch (e) {
                 result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: e.message });
             }
@@ -130,46 +153,12 @@ router.get('/library', async (req, res) => {
         return res.status(400).send("Missing 'id' query parameter");
     }
     try {
-        let url = `${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${id}&Fields=BasicSyncInfo,ProductionYear,Overview&StartIndex=0&EnableImageTypes=Primary&Backdrop&Thumb&ImageTypeLimit=1&Recursive=true&Filters=IsNotFolder&EnableImageTypes=Primary,Backdrop,Thumb`;
-        if (req.query.sortBy) {
-            url += `&SortBy=${encodeURIComponent(sortBy)}`;
+        let url = `${monobar_endpoint}/Items?Ids=${id}&IncludeItemTypes=CollectionFolder`;
+        const { items, error } = await fetchLibraryItems({ parentId: id, host, sortBy, sortOrder });
+        if (error) {
+            return res.status(error.status || 500).send({ message: 'Error fetching library', error: error.statusText || error.message });
         }
-        if (req.query.sortOrder) {
-            url += `&SortOrder=${encodeURIComponent(sortOrder)}`;
-        }
-        const library = await fetch(url, {
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Emby-Token': monobar_token,
-            },
-        });
-        if (!library.ok) {
-            return res.status(library.status).send({ message: 'Error fetching library', error: library.statusText });
-        }
-        const data = await library.json();
-        if (data && data.Items) {
-            data.Items.forEach(item => {
-                let tag = null;
-                let thumbType = null;
-                if (item.ImageTags) {
-                    if (item.ImageTags.Thumb) {
-                        tag = item.ImageTags.Thumb;
-                        thumbType = 'thumb';
-                    } else if (item.ImageTags.Primary) {
-                        tag = item.ImageTags.Primary;
-                        thumbType = 'primary';
-                    }
-                }
-                item.thumbPath = (tag && thumbType && item.Id)
-                    ? `${host}/monobar/image?type=${thumbType}&id=${item.Id}&tag=${tag}`
-                    : '';
-                const posterTag = (item.ImageTags && item.ImageTags.Primary) ? item.ImageTags.Primary : '';
-                item.posterPath = (posterTag && item.Id)
-                    ? `${host}/monobar/image?type=Primary&id=${item.Id}&tag=${posterTag}`
-                    : '';
-            });
-        }
-        const itemInfo = await fetch(`${monobar_endpoint}/Items?Ids=${id}&IncludeItemTypes=CollectionFolder`, {
+        const itemInfo = await fetch(url, {
             headers: {
                 'Content-Type': 'application/json',
                 'X-Emby-Token': monobar_token,
@@ -179,7 +168,7 @@ router.get('/library', async (req, res) => {
             return res.status(itemInfo.status).send({ message: 'Error fetching library', error: itemInfo.statusText });
         }
         const libraryInfoData = await itemInfo.json();
-        res.send({ library: libraryInfoData.Items[0], content: data.Items });
+        res.send({ library: libraryInfoData.Items[0], content: items });
     } catch (e) {
         res.status(500).send("Internal Server Error: " + e.message);
     }
@@ -212,8 +201,52 @@ async function getItemInfo({ id, host }) {
             }
             data.ImageTags = newImageTags;
         }
+        // Replace people image URLs
+        if (Array.isArray(data.People)) {
+            data.People = data.People.map(person => ({
+                ...person,
+                image: person.PrimaryImageTag ? `${host}/monobar/image?type=Primary&id=${person.Id}&tag=${person.PrimaryImageTag}&quality=80&maxHeight=200` : null
+            }));
+        }
         const playUrl = `${host}/monobar/watch?intent=play&id=${id}`;
         return { ...data, playUrl };
+    } catch (e) {
+        throw e;
+    }
+}
+
+async function getRecommendationInfo({ id, host }) {
+    try {
+        const info = await fetch(`${monobar_endpoint}/Items/${id}/Similar?limit=12&UserId=${monobar_user}&fields=ShareLevel&EnableTotalRecordCount=false`, {
+            method: 'GET',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Emby-Token': monobar_token,
+            },
+        });
+        if (!info.ok) {
+            throw new Error(`Error fetching item info: ${info.statusText}`);
+        }
+        const data = await info.json();
+        if (!data.Items || !Array.isArray(data.Items)) return [];
+        return data.Items.map(item => {
+            if (item.BackdropImageTags && item.Id && Array.isArray(item.BackdropImageTags) && item.BackdropImageTags[0]) {
+                item.BackdropImageTags = `${host}/monobar/image?type=Backdrop&id=${item.Id}&tag=${item.BackdropImageTags[0]}`;
+            } else if (item.ImageTags && item.ImageTags.Primary) {
+                item.BackdropImageTags = `${host}/monobar/image?type=Primary&id=${item.Id}&tag=${item.ImageTags.Primary}&maxWidth=1920&maxHeight=1080`;
+            } else {
+                item.BackdropImageTags = null;
+            }
+            if (item.ImageTags && item.Id) {
+                const newImageTags = {};
+                for (const [type, tag] of Object.entries(item.ImageTags)) {
+                    newImageTags[type] = `${host}/monobar/image?type=${type}&id=${item.Id}&tag=${tag}`;
+                }
+                item.ImageTags = newImageTags;
+            }
+            item.playUrl = `${host}/monobar/watch?intent=play&id=${item.Id}`;
+            return item;
+        });
     } catch (e) {
         throw e;
     }
@@ -277,7 +310,15 @@ router.get('/watch', async (req, res) => {
     }
     if (intent == 'info') {
         try {
-            const result = await getItemInfo({ id, host });
+            const [itemInfo, recommendation] = await Promise.all([
+                getItemInfo({ id, host }),
+                getRecommendationInfo({ id, host })
+            ]);
+            const result = {
+                ...itemInfo,
+                recommendation: recommendation || [],
+            };
+            // console.log(result)
             res.send(result);
         } catch (e) {
             res.status(500).send("Internal Server Error: " + e.message);
@@ -363,12 +404,13 @@ router.get('/watch/master/playlist', async (req, res) => {
     }
     try {
         const itemInfo = await getItemInfo({ id, host });
+        console.log("Item Info:", itemInfo);
         const width = itemInfo.Width || (itemInfo.MediaStreams && itemInfo.MediaStreams.find(s => s.Type === 'Video')?.Width);
         const height = itemInfo.Height || (itemInfo.MediaStreams && itemInfo.MediaStreams.find(s => s.Type === 'Video')?.Height);
         const allQualities = [
-            { label: '360p', maxWidth: 640, maxHeight: 360, maxBitrate: 800000 },
-            { label: '480p', maxWidth: 854, maxHeight: 480, maxBitrate: 1200000 },
-            { label: '720p', maxWidth: 1280, maxHeight: 720, maxBitrate: 2500000 },
+            { label: '360p', maxWidth: 640, maxHeight: 360, maxBitrate: 1000000 },
+            { label: '480p', maxWidth: 854, maxHeight: 480, maxBitrate: 1750000 },
+            { label: '720p', maxWidth: 1280, maxHeight: 720, maxBitrate: 3000000 },
         ];
         let allowedQualities = [];
         for (const q of allQualities) {
@@ -385,6 +427,7 @@ router.get('/watch/master/playlist', async (req, res) => {
         if (allowedQualities.length === 0) {
             allowedQualities.push(allQualities[0]);
         }
+        console.log("Allowed qualities:", allowedQualities);
         const variantInfos = [];
         for (const q of allowedQualities) {
             const info = await getEmbyPlaybackInfo({ id, ...q, genSessionId });
@@ -558,6 +601,7 @@ router.get('/watch/main/segment/*', async (req, res) => {
             res.setHeader('Content-Length', contentLength);
         }
         if (segmentResponse.body) {
+            // console.log("Streaming segment:", segmentResponse.url);
             const nodeStream = Readable.fromWeb(segmentResponse.body);
             nodeStream.pipe(res);
             await new Promise((resolve, reject) => {
@@ -673,15 +717,15 @@ router.get('/image', async (req, res) => {
     }
     let imageUrl = `${monobar_endpoint}/Items/${id}/Images/${type}?tag=${tag}`;
     if (type === 'Logo') {
-        imageUrl += '&maxHeight=90';
+        imageUrl += '&maxHeight=120';
     } else if (type === 'Backdrop') {
-        imageUrl += 'maxWidth=1920&maxHeight=1080&quality=30';
+        imageUrl += 'maxWidth=1920&maxHeight=1080&quality=70';
     } else if (type === 'Thumb' || type === 'thumb') {
-        imageUrl += 'maxWidth=640&maxHeight=360&quality=90';
+        imageUrl += 'maxWidth=640&maxHeight=360&quality=100';
     } else {
-        const maxWidth = req.query.maxWidth || 225;
-        const maxHeight = req.query.maxHeight || 338;
-        const quality = req.query.quality || 90;
+        const maxWidth = req.query.maxWidth || 250;
+        const maxHeight = req.query.maxHeight || 375;
+        const quality = req.query.quality || 100;
         imageUrl += `&maxWidth=${maxWidth}&maxHeight=${maxHeight}&quality=${quality}`;
     }
     try {
