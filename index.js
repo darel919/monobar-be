@@ -14,10 +14,28 @@ function generateGenSessionId() {
     return crypto.randomBytes(16).toString('hex');
 }
 
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function stopEmbyTranscodeWithDelay(deviceId, playSessionId) {
+    await delay(10000);
+    if (!deviceId || !playSessionId) return;
+    const url = `${monobar_endpoint}/Videos/ActiveEncodings?DeviceId=${deviceId}&PlaySessionId=${playSessionId}`;
+    try {
+        const response = await fetch(url, {
+            method: 'DELETE',
+            headers: {
+                'X-Emby-Token': monobar_token,
+            },
+        });
+        await response.text();
+    } catch (e) {}
+}
+
 async function fetchLibraryItems({ parentId, host, sortBy, sortOrder, limit, itemType }) {
     let url;
     if (itemType === 'series') {
-        // Fetch TV series, not episodes
         url = `${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${parentId}` +
             `&IncludeItemTypes=Series` +
             `&Fields=BasicSyncInfo,CanDelete,CanDownload,PrimaryImageAspectRatio,ProductionYear,Status,EndDate` +
@@ -27,7 +45,6 @@ async function fetchLibraryItems({ parentId, host, sortBy, sortOrder, limit, ite
             `&EnableImageTypes=Primary,Backdrop,Thumb&ImageTypeLimit=1&Recursive=true` +
             (limit ? `&Limit=${encodeURIComponent(limit)}` : '');
     } else if (itemType === 'latest-tv') {
-        // For latest TV items (used in / endpoint)
         url = `${monobar_endpoint}/Users/${monobar_user}/Items/Latest?ParentId=${parentId}` +
             `&Fields=BasicSyncInfo,ProductionYear,Overview,Status,EndDate` +
             `&IncludeImageTypes=Primary,Backdrop,Thumb` +
@@ -35,7 +52,6 @@ async function fetchLibraryItems({ parentId, host, sortBy, sortOrder, limit, ite
             (sortOrder ? `&SortOrder=${encodeURIComponent(sortOrder)}` : '') +
             (limit ? `&Limit=${encodeURIComponent(limit)}` : '');
     } else {
-        // Default: movies/items
         url = `${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${parentId}` +
             `&Fields=BasicSyncInfo,ProductionYear,Overview` +
             `&StartIndex=0&Recursive=true&Filters=IsNotFolder&IncludeImageTypes=Logo` +
@@ -96,7 +112,6 @@ async function extractBandwidthFromMasterPlaylist(data) {
             headers: { 'X-Emby-Token': monobar_token }
         });
         if (!response.ok) {
-            console.error('Unable to fetch master playlist for bandwidth data:', response.statusText);
             return null
         };
         
@@ -108,9 +123,7 @@ async function extractBandwidthFromMasterPlaylist(data) {
                 if (bandwidthMatch) return parseInt(bandwidthMatch[1]);
             }
         }
-    } catch (e) {
-        console.error('Error fetching master playlist:', e);
-    }
+    } catch (e) {}
     return null;
 }
 
@@ -127,6 +140,64 @@ async function stopEmbyTranscode(deviceId, playSessionId) {
         await response.text();
     } catch (e) {}
 }
+
+async function getEmbyPlaySessionId({ id, maxWidth, maxHeight, maxBitrate, genSessionId, audioStreamIndex }) {
+    const playbackInfoRes = await fetch(`${monobar_endpoint}/Items/${id}/PlaybackInfo?UserId=${monobar_user}&StartTimeTicks=0&IsPlayback=true&AutoOpenLiveStream=true&reqformat=json`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Emby-Token': monobar_token,
+        },
+        body: JSON.stringify({
+            "DeviceProfile": {
+                "MaxStaticBitrate": maxBitrate,
+                "MaxStreamingBitrate": maxBitrate,
+                "TranscodingProfiles": [
+                    {
+                        "Container": "ts",
+                        "Type": "Video",
+                        "AudioCodec": "aac",
+                        "VideoCodec": "h264",
+                        "Context": "Streaming",
+                        "Protocol": "hls",
+                        "MaxAudioChannels": "6",
+                        "MinSegments": "1",
+                        "BreakOnNonKeyFrames": true,
+                    }
+                ],
+                "CodecProfiles": [
+                    {
+                        "Type": "Video",
+                        "Codec": "h264",
+                        "Conditions": [
+                            { "Condition": "LessThanEqual", "Property": "Width", "Value": String(maxWidth) },
+                            { "Condition": "LessThanEqual", "Property": "Height", "Value": String(maxHeight) }
+                        ]
+                    }
+                ]
+            },
+            "PlaySessionId": genSessionId,
+            ...(audioStreamIndex !== undefined ? { "AudioStreamIndex": audioStreamIndex } : {})
+        })
+    });
+    if (!playbackInfoRes.ok) return null;
+    const playbackInfo = await playbackInfoRes.json();
+    return playbackInfo && playbackInfo.MediaSources && playbackInfo.MediaSources[0] && playbackInfo.MediaSources[0].PlaySessionId;
+}
+
+setInterval(async () => {
+    const now = Date.now();
+    for (const [key, session] of playSessionCache.entries()) {
+        if (now - session.lastAccessed > 60000) {
+            if (session.embySessionIds && session.deviceId) {
+                for (const embyId of Object.values(session.embySessionIds)) {
+                    await stopEmbyTranscode(session.deviceId, embyId);
+                }
+            }
+            playSessionCache.delete(key);
+        }
+    }
+}, 10000);
 
 router.use((req, res, next) => {
     if (req.headers['x-environment'] === 'development') {
@@ -320,7 +391,7 @@ async function getRecommendationInfo({ id, host }) {
     }
 }
 
-async function getEmbyPlaybackInfo({ id, maxWidth, maxHeight, maxBitrate, label, genSessionId }) {
+async function getEmbyPlaybackInfo({ id, maxWidth, maxHeight, maxBitrate, label, genSessionId, audioStreamIndex }) {
     const playbackInfoRes = await fetch(`${monobar_endpoint}/Items/${id}/PlaybackInfo?UserId=${monobar_user}&StartTimeTicks=0&IsPlayback=true&AutoOpenLiveStream=true&reqformat=json`, {
         method: 'POST',
         headers: {
@@ -355,7 +426,8 @@ async function getEmbyPlaybackInfo({ id, maxWidth, maxHeight, maxBitrate, label,
                     }
                 ]
             },
-            "PlaySessionId": genSessionId
+            "PlaySessionId": genSessionId,
+            ...(audioStreamIndex !== undefined ? { "AudioStreamIndex": audioStreamIndex } : {})
         })
     });
     if (!playbackInfoRes.ok) return null;
@@ -375,6 +447,254 @@ async function getEmbyPlaybackInfo({ id, maxWidth, maxHeight, maxBitrate, label,
         actualBandwidth 
     };
 }
+
+router.get('/play', async (req, res) => {
+    const id = req.query.id;
+    const genSessionId = req.query.genSessionId;
+    const q = req.query.q;
+    let audioStreamIndex = req.query.audioStreamIndex !== undefined ? parseInt(req.query.audioStreamIndex) : undefined;
+    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
+    if (!id || !genSessionId || !q) return res.status(400).send("Missing 'id', 'genSessionId', or 'q' query parameter");
+    const sessionKey = `${id}:${genSessionId}`;
+    let session = playSessionCache.get(sessionKey);
+    if (!session) {
+        session = {
+            genSessionId,
+            embySessionIds: {},
+            deviceId: undefined,
+            lastAccessed: Date.now(),
+            lastAudioStreamIndex: audioStreamIndex
+        };
+        playSessionCache.set(sessionKey, session);
+    } else {
+        session.lastAccessed = Date.now();
+    }
+    if (audioStreamIndex !== undefined) {
+        session.lastAudioStreamIndex = audioStreamIndex;
+    } else if (session.lastAudioStreamIndex !== undefined) {
+        audioStreamIndex = session.lastAudioStreamIndex;
+    }
+    const allQualities = [
+        { label: '360p', maxWidth: 640, maxHeight: 360, maxBitrate: 1000000 },
+        { label: '480p', maxWidth: 854, maxHeight: 480, maxBitrate: 1750000 },
+        { label: '720p', maxWidth: 1280, maxHeight: 720, maxBitrate: 3000000 },
+    ];
+    const quality = allQualities.find(x => x.label === q);
+    if (!quality) return res.status(400).send("Invalid quality");
+    const info = await getEmbyPlaybackInfo({ id, ...quality, genSessionId, audioStreamIndex });
+    if (!info) return res.status(500).send("Failed to get playback info");
+    if (!session.deviceId) {
+        if (info.ms.DeviceId) {
+            session.deviceId = info.ms.DeviceId;
+        } else if (info.ms.TranscodingUrl) {
+            const urlObj = new URL(info.ms.TranscodingUrl, 'http://dummy');
+            const deviceIdFromUrl = urlObj.searchParams.get('DeviceId');
+            if (deviceIdFromUrl) session.deviceId = deviceIdFromUrl;
+        }
+    }
+    const embyKey = audioStreamIndex !== undefined ? `${q}:${audioStreamIndex}` : q;
+    session.embySessionIds[embyKey] = info.ms.PlaySessionId || info.playSessionId;
+    session.lastAudioStreamIndex = audioStreamIndex;
+    const playlistUrl = `${host}/monobar/play/playlist?id=${id}&genSessionId=${genSessionId}&q=${q}`;
+    res.redirect(playlistUrl);
+});
+
+router.get('/play/playlist', async (req, res) => {
+    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
+    let id = req.query.id;
+    let genSessionId = req.query.genSessionId;
+    let q = req.query.q;
+    let audioStreamIndex = req.query.audioStreamIndex !== undefined ? parseInt(req.query.audioStreamIndex) : undefined;
+    if ((!id || !genSessionId || !q) && req.query.label && req.query.PlaySessionId) {
+        id = req.query.id;
+        let foundSessionKey = null;
+        let foundQ = null;
+        for (const [key, session] of playSessionCache.entries()) {
+            for (const [quality, embyId] of Object.entries(session.embySessionIds || {})) {
+                if (embyId === req.query.PlaySessionId) {
+                    foundSessionKey = key;
+                    foundQ = quality;
+                    break;
+                }
+            }
+            if (foundSessionKey) break;
+        }
+        if (foundSessionKey) {
+            const [foundId, foundGenSessionId] = foundSessionKey.split(":");
+            id = foundId;
+            genSessionId = foundGenSessionId;
+            q = foundQ || req.query.label;
+        }
+    }
+    if (!id || !genSessionId || !q) {
+        return res.status(400).send("Missing 'id', 'genSessionId', or 'q' query parameter");
+    }
+    const sessionKey = `${id}:${genSessionId}`;
+    let session = playSessionCache.get(sessionKey);
+    if (!session) {
+        session = {
+            genSessionId,
+            embySessionIds: {},
+            deviceId: undefined,
+            lastAccessed: Date.now(),
+            lastAudioStreamIndex: audioStreamIndex
+        };
+        playSessionCache.set(sessionKey, session);
+    } else {
+        session.lastAccessed = Date.now();
+        if (audioStreamIndex !== undefined) session.lastAudioStreamIndex = audioStreamIndex;
+        else if (session.lastAudioStreamIndex !== undefined) audioStreamIndex = session.lastAudioStreamIndex;
+    }
+    const embyKey = audioStreamIndex !== undefined ? `${q}:${audioStreamIndex}` : q;
+    let embySessionId = session.embySessionIds[embyKey];
+    let deviceId = session.deviceId;
+    if (!embySessionId || !deviceId) {
+        const allQualities = [
+            { label: '360p', maxWidth: 640, maxHeight: 360, maxBitrate: 1000000 },
+            { label: '480p', maxWidth: 854, maxHeight: 480, maxBitrate: 1750000 },
+            { label: '720p', maxWidth: 1280, maxHeight: 720, maxBitrate: 3000000 },
+        ];
+        const quality = allQualities.find(x => x.label === q);
+        const info = await getEmbyPlaybackInfo({ id, ...quality, genSessionId, audioStreamIndex });
+        if (!info) return res.status(500).send("Failed to get playback info");
+        if (!session.deviceId) {
+            if (info.ms.DeviceId) {
+                session.deviceId = info.ms.DeviceId;
+            } else if (info.ms.TranscodingUrl) {
+                const urlObj = new URL(info.ms.TranscodingUrl, 'http://dummy');
+                const deviceIdFromUrl = urlObj.searchParams.get('DeviceId');
+                if (deviceIdFromUrl) session.deviceId = deviceIdFromUrl;
+            }
+        }
+        session.embySessionIds[embyKey] = info.ms.PlaySessionId || info.playSessionId;
+        session.lastAudioStreamIndex = audioStreamIndex;
+        embySessionId = session.embySessionIds[embyKey];
+        deviceId = session.deviceId;
+    }
+    const queryParams = new URLSearchParams();
+    queryParams.set('DeviceId', deviceId);
+    queryParams.set('PlaySessionId', embySessionId);
+    queryParams.set('label', q);
+    queryParams.set('api_key', monobar_token);
+    if (audioStreamIndex !== undefined) queryParams.set('AudioStreamIndex', audioStreamIndex);
+    const baseMonobarUrl = `${monobar_endpoint}/videos/${id}`;
+    const originalM3u8Url = `${baseMonobarUrl}/main.m3u8?${queryParams.toString()}`;
+    try {
+        const watchPointResponse = await fetch(originalM3u8Url);
+        if (!watchPointResponse.ok) {
+            return res.status(watchPointResponse.status).send(`Error fetching M3U8: ${watchPointResponse.statusText}`);
+        }
+        const m3u8Content = await watchPointResponse.text();
+        const lines = m3u8Content.split('\n');
+        const modifiedLines = lines.map(line => {
+            line = line.trim();
+            if (line && !line.startsWith('#')) {
+                let url = `${host}/monobar/play/segment/${line}?id=${id}&genSessionId=${genSessionId}&q=${q}`;
+                if (audioStreamIndex !== undefined) url += `&audioStreamIndex=${audioStreamIndex}`;
+                return url;
+            }
+            return line;
+        });
+        const modifiedM3u8Content = modifiedLines.join('\n');
+        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+        res.send(modifiedM3u8Content);
+    } catch (e) {
+        res.status(500).send("Internal Server Error: " + e.message);
+    }
+});
+
+router.get('/play/segment/*', async (req, res) => {
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    const segmentPath = req.params[0];
+    let mergedQuery = { ...req.query };
+    const urlParts = req.originalUrl.split('?');
+    if (urlParts.length > 2) {
+        for (let i = 2; i < urlParts.length; i++) {
+            const extraParams = new URLSearchParams(urlParts[i]);
+            for (const [key, value] of extraParams.entries()) {
+                mergedQuery[key] = value;
+            }
+        }
+    }
+    let id = mergedQuery.id;
+    let genSessionId = mergedQuery.genSessionId;
+    let q = mergedQuery.q;
+    let audioStreamIndex = mergedQuery.audioStreamIndex !== undefined ? parseInt(mergedQuery.audioStreamIndex) : undefined;
+    if ((!id || !genSessionId || !q) && mergedQuery.PlaySessionId) {
+        let foundSessionKey = null;
+        let foundQ = null;
+        for (const [key, session] of playSessionCache.entries()) {
+            for (const [quality, embyId] of Object.entries(session.embySessionIds || {})) {
+                if (embyId === mergedQuery.PlaySessionId) {
+                    foundSessionKey = key;
+                    foundQ = quality;
+                    break;
+                }
+            }
+            if (foundSessionKey) break;
+        }
+        if (foundSessionKey) {
+            const [foundId, foundGenSessionId] = foundSessionKey.split(":");
+            id = foundId;
+            genSessionId = foundGenSessionId;
+            q = foundQ;
+        }
+    }
+    if (!id || !genSessionId || !q) {
+        return res.status(400).send("Missing 'id', 'genSessionId', or 'q' query parameter");
+    }
+    const sessionKey = `${id}:${genSessionId}`;
+    const session = playSessionCache.get(sessionKey);
+    if (!session) {
+        return res.status(404).send("Session not found");
+    }
+    const embyKey = audioStreamIndex !== undefined ? `${q}:${audioStreamIndex}` : q;
+    const embySessionId = session.embySessionIds[embyKey];
+    const deviceId = session.deviceId;
+    if (!embySessionId || !deviceId) {
+        return res.status(404).send("Emby session not found");
+    }
+    session.lastUsed = Date.now();
+    session.lastAccessed = Date.now();
+    const queryParams = new URLSearchParams();
+    queryParams.set('DeviceId', deviceId);
+    queryParams.set('PlaySessionId', embySessionId);
+    queryParams.set('api_key', monobar_token);
+    if (audioStreamIndex !== undefined) queryParams.set('AudioStreamIndex', audioStreamIndex);
+    const originalSegmentUrl = `${monobar_endpoint}/videos/${id}/${segmentPath}?${queryParams.toString()}`;
+    let segmentResponse;
+    let retries = 5;
+    let delayMs = 1000;
+    for (let attempt = 0; attempt < retries; attempt++) {
+        segmentResponse = await fetch(originalSegmentUrl);
+        if (segmentResponse.ok) break;
+        if (segmentResponse.status !== 404) break;
+        if (attempt < retries - 1) await delay(delayMs);
+    }
+    if (!segmentResponse.ok) {
+        return res.status(segmentResponse.status).send(`Error fetching segment: ${segmentResponse.statusText}`);
+    }
+    res.setHeader('Content-Type', segmentResponse.headers.get('Content-Type') || 'video/mp2t');
+    const contentLength = segmentResponse.headers.get('Content-Length');
+    if (contentLength) {
+        res.setHeader('Content-Length', contentLength);
+    }
+    if (segmentResponse.body) {
+        const nodeStream = Readable.fromWeb(segmentResponse.body);
+        nodeStream.pipe(res);
+        await new Promise((resolve, reject) => {
+            nodeStream.on('end', resolve);
+            nodeStream.on('error', reject);
+            res.on('close', () => {
+                nodeStream.destroy();
+                resolve();
+            });
+            res.on('error', reject);
+        });
+    } else {
+        res.end();
+    }
+});
 
 router.get('/watch', async (req, res) => {
     const id = req.query.id;
@@ -422,7 +742,6 @@ router.get('/watch', async (req, res) => {
             let chaptersArr = [];
             if (infoData.MediaSources && infoData.MediaSources.length > 0) {
                 const mediaSourceId = infoData.MediaSources[0].Id;
-                // Build chapters array for ArtPlayer
                 const chapters = infoData.MediaSources[0].Chapters || [];
                 const durationTicks = infoData.MediaSources[0].RunTimeTicks || infoData.RunTimeTicks || null;
                 for (let i = 0; i < chapters.length; i++) {
@@ -435,7 +754,7 @@ router.get('/watch', async (req, res) => {
                     } else if (durationTicks) {
                         end = durationTicks / 10000000;
                     } else {
-                        end = start + 10; // fallback: 10s duration
+                        end = start + 10;
                     }
                     chaptersArr.push({
                         start,
@@ -488,7 +807,7 @@ router.get('/watch/master/playlist', async (req, res) => {
     const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
     const deviceId = req.query.DeviceId;
     if (!id || !genSessionId) return res.status(400).send("Missing 'id' or 'genSessionId' query parameter");
-    const sessionKey = `${id}:${req.ip}`;
+    const sessionKey = `${id}:${genSessionId}`;
     let session = playSessionCache.get(sessionKey);
     if (!session) {
         session = {
@@ -496,6 +815,7 @@ router.get('/watch/master/playlist', async (req, res) => {
             embySessionIds: {},
             deviceId: deviceId || undefined,
             lastAccessed: Date.now(),
+            lastAudioStreamIndex: undefined
         };
         playSessionCache.set(sessionKey, session);
     } else {
@@ -526,47 +846,18 @@ router.get('/watch/master/playlist', async (req, res) => {
         if (allowedQualities.length === 0) {
             allowedQualities.push(allQualities[0]);
         }
-        const variantInfos = [];
-        
-        for (const q of allowedQualities) {
-            const info = await getEmbyPlaybackInfo({ id, ...q, genSessionId });
-            if (!info) continue;
-            if (!session.deviceId) {
-                if (info.ms.DeviceId) {
-                    session.deviceId = info.ms.DeviceId;
-                } else if (info.ms.TranscodingUrl) {
-                    const urlObj = new URL(info.ms.TranscodingUrl, 'http://dummy');
-                    const deviceIdFromUrl = urlObj.searchParams.get('DeviceId');
-                    if (deviceIdFromUrl) session.deviceId = deviceIdFromUrl;
-                }
-            }
-            const newPlaySessionId = info.ms.PlaySessionId || info.playSessionId;
-            const prevPlaySessionId = session.embySessionIds[q.label];
-            if (prevPlaySessionId && session.deviceId) {
-                try {
-                    await fetch(`${host}/monobar/status?deviceId=${session.deviceId}&playSessionId=${prevPlaySessionId}`, {
-                        method: 'DELETE',
-                    });
-                } catch (e) {}
-            }
-            session.embySessionIds[q.label] = newPlaySessionId;
-            const urlObj = info.ms.TranscodingUrl ? new URL(info.ms.TranscodingUrl, 'http://dummy') : null;
-            const params = urlObj ? urlObj.searchParams : new URLSearchParams();
-            params.set('PlaySessionId', newPlaySessionId);
-            const variantUrl = `${host}/monobar/watch/main/playlist?id=${id}&${params.toString()}&label=${q.label}&DeviceId=${session.deviceId}`;
-            
-            const bandwidth = info.actualBandwidth;
-            
-            variantInfos.push({
-                url: variantUrl,
-                bandwidth,
-                resolution: `${q.maxWidth}x${q.maxHeight}`,
-                label: q.label
-            });
+        const audioStreams = (itemInfo.MediaStreams || []).filter(s => s.Type === 'Audio');
+        if (audioStreams.length > 0 && session.lastAudioStreamIndex === undefined) {
+            session.lastAudioStreamIndex = audioStreams[0].Index;
         }
         let masterM3U8 = '#EXTM3U\n';
-        for (const v of variantInfos) {
-            masterM3U8 += `#EXT-X-STREAM-INF:BANDWIDTH=${v.bandwidth},RESOLUTION=${v.resolution},NAME=\"${v.label}\"\n${v.url}\n`;
+        if (audioStreams.length > 0) {
+            for (const audio of audioStreams) {
+                masterM3U8 += `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"${audio.DisplayTitle || audio.Language || 'Audio ' + audio.Index}\",DEFAULT=${audio.Index === audioStreams[0].Index ? 'YES' : 'NO'},AUTOSELECT=${audio.Index === audioStreams[0].Index ? 'YES' : 'NO'},LANGUAGE=\"${audio.Language || ''}\",URI=\"${host}/monobar/play/playlist?id=${id}&genSessionId=${genSessionId}&q=720p&audioStreamIndex=${audio.Index}\"\n`;
+            }
+        }
+        for (const q of allowedQualities) {
+            masterM3U8 += `#EXT-X-STREAM-INF:BANDWIDTH=${q.maxBitrate},RESOLUTION=${q.maxWidth}x${q.maxHeight},NAME=\"${q.label}\",AUDIO=\"audio\"\n${host}/monobar/play/playlist?id=${id}&genSessionId=${genSessionId}&q=${q.label}\n`;
         }
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(masterM3U8);
@@ -716,7 +1007,6 @@ router.get('/watch/main/segment/*', async (req, res) => {
             res.end();
         }
     } catch (e) {
-        console.error("Error fetching segment:", e);
         if (!res.headersSent) {
             res.status(500).send("Internal Server Error");
         } else {
@@ -749,6 +1039,154 @@ router.get('/watch/subtitle', async (req, res) => {
         res.send(subtitleData);
     } catch (e) {
         res.status(500).send("Internal Server Error: " + e.message);
+    }
+});
+
+router.post('/status', async (req, res) => {
+    const intent = req.body.intent;
+    const currentTime = req.body.currentTime;
+    const seekableRange = req.body.seekableRange;
+    const playSessionId = req.body.playSessionId;
+    const currentSubtitleIndex = req.body.currentSubtitleIndex;
+    const currentAudioIndex = req.body.currentAudioIndex;
+    const mediaSourceId = req.body.mediaSourceId;
+    const itemId = req.body.itemId;
+    const playbackStartTimeTicks = req.body.playbackStartTimeTicks;
+    const playlistIndex = req.body.playlistIndex || 0;
+    const playlistLength = req.body.playlistLength || 1;
+    const nowPlayingQueue = req.body.nowPlayingQueue;
+
+    const toTicks = (seconds) => typeof seconds === 'number' ? Math.round(seconds * 10000000) : seconds;
+    const positionTicks = toTicks(currentTime) || 0;
+    let defaultSeekableRanges = [];
+    if (seekableRange && typeof seekableRange === 'object' && seekableRange.start !== undefined && seekableRange.end !== undefined) {
+        defaultSeekableRanges = [{
+            start: toTicks(seekableRange.start),
+            end: toTicks(seekableRange.end)
+        }];
+    }
+
+    let playSessionIdToUse = playSessionId;
+    if (intent === 'unpause') {
+        const sessionKey = `${itemId}:${req.body.genSessionId || ''}`;
+        const session = playSessionCache.get(sessionKey);
+        let sessionNeedsRestart = false;
+        if (!session || !session.embySessionIds || !Object.values(session.embySessionIds).includes(playSessionId)) {
+            sessionNeedsRestart = true;
+        }
+        if (sessionNeedsRestart) {
+            const quality = req.body.quality || '720p';
+            const allQualities = [
+                { label: '360p', maxWidth: 640, maxHeight: 360, maxBitrate: 1000000 },
+                { label: '480p', maxWidth: 854, maxHeight: 480, maxBitrate: 1750000 },
+                { label: '720p', maxWidth: 1280, maxHeight: 720, maxBitrate: 3000000 },
+            ];
+            const q = allQualities.find(x => x.label === quality) || allQualities[2];
+            const newPlaySessionId = await getEmbyPlaySessionId({
+                id: itemId,
+                maxWidth: q.maxWidth,
+                maxHeight: q.maxHeight,
+                maxBitrate: q.maxBitrate,
+                genSessionId: req.body.genSessionId,
+                audioStreamIndex: currentAudioIndex
+            });
+            if (newPlaySessionId) {
+                playSessionIdToUse = newPlaySessionId;
+                if (session) {
+                    session.embySessionIds[quality] = newPlaySessionId;
+                } else {
+                    playSessionCache.set(sessionKey, {
+                        genSessionId: req.body.genSessionId,
+                        embySessionIds: { [quality]: newPlaySessionId },
+                        deviceId: undefined,
+                        lastAccessed: Date.now(),
+                        lastAudioStreamIndex: currentAudioIndex
+                    });
+                }
+            }
+        }
+    }
+
+    const baseBody = {
+        IsMuted: false,
+        PlaybackRate: 1,
+        PlayMethod: "Transcode",
+        PlaySessionId: playSessionIdToUse,
+        MediaSourceId: mediaSourceId,
+        CanSeek: true,
+        ItemId: itemId,
+    };
+    let body = {};
+    if (intent === 'play') {
+        body = {
+            ...baseBody,
+            IsPaused: false,
+            PositionTicks: positionTicks || 90000,
+            PlaybackStartTimeTicks: playbackStartTimeTicks,
+            SubtitleStreamIndex: currentSubtitleIndex,
+            AudioStreamIndex: currentAudioIndex,
+            BufferedRanges: [],
+            SeekableRanges: defaultSeekableRanges,
+            EventName: undefined,
+            NowPlayingQueue: nowPlayingQueue || [{ Id: itemId, PlaylistItemId: req.body.playlistItemId || "playlistItem125" }]
+        };
+    } else if (intent === 'timeupdate') {
+        body = {
+            ...baseBody,
+            IsPaused: false,
+            PositionTicks: positionTicks || 90000,
+            PlaybackStartTimeTicks: playbackStartTimeTicks,
+            SubtitleStreamIndex: currentSubtitleIndex,
+            AudioStreamIndex: currentAudioIndex,
+            BufferedRanges: [],
+            SeekableRanges: defaultSeekableRanges,
+            EventName: 'timeupdate',
+        };
+    } else if (intent === 'pause') {
+        body = {
+            ...baseBody,
+            IsPaused: true,
+            PositionTicks: positionTicks || 118760670,
+            PlaybackStartTimeTicks: playbackStartTimeTicks,
+            SubtitleStreamIndex: currentSubtitleIndex,
+            AudioStreamIndex: currentAudioIndex,
+            BufferedRanges: [],
+            SeekableRanges: defaultSeekableRanges,
+            EventName: 'pause',
+        };
+    } else if (intent === 'unpause') {
+        body = {
+            ...baseBody,
+            IsPaused: false,
+            PositionTicks: positionTicks || 118760670,
+            PlaybackStartTimeTicks: playbackStartTimeTicks,
+            SubtitleStreamIndex: currentSubtitleIndex,
+            AudioStreamIndex: currentAudioIndex,
+            BufferedRanges: [],
+            SeekableRanges: defaultSeekableRanges,
+            EventName: 'unpause',
+        };
+    } else {
+        return res.status(400).send("Invalid intent");
+    }
+    Object.keys(body).forEach(key => body[key] === undefined && delete body[key]);
+    try {
+        const response = await fetch(`${monobar_endpoint}/Sessions/Playing`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Emby-Token': monobar_token,
+            },
+            body: JSON.stringify(body)
+        });
+        if (response.status === 204) {
+            return res.status(204).send();
+        } else {
+            const errorText = await response.text();
+            return res.status(response.status).send({ message: 'Failed to update status', error: errorText });
+        }
+    } catch (e) {
+        return res.status(500).send("Internal Server Error: " + e.message);
     }
 });
 
