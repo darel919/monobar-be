@@ -14,31 +14,34 @@ function generateGenSessionId() {
     return crypto.randomBytes(16).toString('hex');
 }
 
-async function stopEmbyTranscode(deviceId, playSessionId) {
-    if (!deviceId || !playSessionId) return;
-    const url = `${monobar_endpoint}/Videos/ActiveEncodings?DeviceId=${deviceId}&PlaySessionId=${playSessionId}`;
-    try {
-        const response = await fetch(url, {
-            method: 'DELETE',
-            headers: {
-                'X-Emby-Token': monobar_token,
-            },
-        });
-        await response.text();
-    } catch (e) {}
-}
-
-async function fetchLibraryItems({ parentId, host, sortBy, sortOrder, limit }) {
-    // console.log(limit)
-    let url = `${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${parentId}&Fields=BasicSyncInfo,ProductionYear,Overview&StartIndex=0&Recursive=true&Filters=IsNotFolder&IncludeImageTypes=Logo`;
-    if (sortBy) {
-        url += `&SortBy=${encodeURIComponent(sortBy)}`;
-    }
-    if (sortOrder) {
-        url += `&SortOrder=${encodeURIComponent(sortOrder)}`;
-    }
-    if (limit) {
-        url += `&Limit=${encodeURIComponent(limit)}`;
+async function fetchLibraryItems({ parentId, host, sortBy, sortOrder, limit, itemType }) {
+    let url;
+    if (itemType === 'series') {
+        // Fetch TV series, not episodes
+        url = `${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${parentId}` +
+            `&IncludeItemTypes=Series` +
+            `&Fields=BasicSyncInfo,CanDelete,CanDownload,PrimaryImageAspectRatio,ProductionYear,Status,EndDate` +
+            `&StartIndex=0` +
+            (sortBy ? `&SortBy=${encodeURIComponent(sortBy)}` : '') +
+            (sortOrder ? `&SortOrder=${encodeURIComponent(sortOrder)}` : '') +
+            `&EnableImageTypes=Primary,Backdrop,Thumb&ImageTypeLimit=1&Recursive=true` +
+            (limit ? `&Limit=${encodeURIComponent(limit)}` : '');
+    } else if (itemType === 'latest-tv') {
+        // For latest TV items (used in / endpoint)
+        url = `${monobar_endpoint}/Users/${monobar_user}/Items/Latest?ParentId=${parentId}` +
+            `&Fields=BasicSyncInfo,ProductionYear,Overview,Status,EndDate` +
+            `&IncludeImageTypes=Primary,Backdrop,Thumb` +
+            (sortBy ? `&SortBy=${encodeURIComponent(sortBy)}` : '') +
+            (sortOrder ? `&SortOrder=${encodeURIComponent(sortOrder)}` : '') +
+            (limit ? `&Limit=${encodeURIComponent(limit)}` : '');
+    } else {
+        // Default: movies/items
+        url = `${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${parentId}` +
+            `&Fields=BasicSyncInfo,ProductionYear,Overview` +
+            `&StartIndex=0&Recursive=true&Filters=IsNotFolder&IncludeImageTypes=Logo` +
+            (sortBy ? `&SortBy=${encodeURIComponent(sortBy)}` : '') +
+            (sortOrder ? `&SortOrder=${encodeURIComponent(sortOrder)}` : '') +
+            (limit ? `&Limit=${encodeURIComponent(limit)}` : '');
     }
     try {
         const library = await fetch(url, {
@@ -51,8 +54,9 @@ async function fetchLibraryItems({ parentId, host, sortBy, sortOrder, limit }) {
             return { error: { message: 'Error fetching library', status: library.status, statusText: library.statusText }, items: [] };
         }
         const data = await library.json();
-        if (data && data.Items) {
-            data.Items.forEach(item => {
+        let items = data.Items || (Array.isArray(data) ? data : []);
+        if (items && Array.isArray(items)) {
+            items.forEach(item => {
                 let tag = null;
                 let thumbType = null;
                 if (item.ImageTags) {
@@ -76,20 +80,17 @@ async function fetchLibraryItems({ parentId, host, sortBy, sortOrder, limit }) {
                     : '';
             });
         }
-        return { items: data.Items || [], error: null };
+        return { items, error: null };
     } catch (e) {
         return { error: { message: e.message }, items: [] };
     }
 }
 
 async function extractBandwidthFromMasterPlaylist(data) {
-    // console.log(data)
     if (!data?.MediaSources[0]?.TranscodingUrl) return null;
     const url = new URL(data.MediaSources[0].TranscodingUrl, monobar_endpoint);
-    console.log(url)
     const urlPath = url.pathname.replace(/\/[^/]+$/, '/master.m3u8');
     const masterUrl = `${monobar_endpoint}${urlPath}?${url.searchParams.toString()}`;
-// console.log(masterUrl)
     try {
         const response = await fetch(masterUrl, {
             headers: { 'X-Emby-Token': monobar_token }
@@ -101,7 +102,6 @@ async function extractBandwidthFromMasterPlaylist(data) {
         
         const content = await response.text();
         const lines = content.split('\n');
-        console.log(content)
         for (const line of lines) {
             if (line.includes('BANDWIDTH=')) {
                 const bandwidthMatch = line.match(/BANDWIDTH=(\d+)/);
@@ -112,6 +112,20 @@ async function extractBandwidthFromMasterPlaylist(data) {
         console.error('Error fetching master playlist:', e);
     }
     return null;
+}
+
+async function stopEmbyTranscode(deviceId, playSessionId) {
+    if (!deviceId || !playSessionId) return;
+    const url = `${monobar_endpoint}/Videos/ActiveEncodings?DeviceId=${deviceId}&PlaySessionId=${playSessionId}`;
+    try {
+        const response = await fetch(url, {
+            method: 'DELETE',
+            headers: {
+                'X-Emby-Token': monobar_token,
+            },
+        });
+        await response.text();
+    } catch (e) {}
 }
 
 router.use((req, res, next) => {
@@ -140,7 +154,6 @@ router.post('/ping', async (req, res) => {
 });
 
 router.get('/', async (req, res) => {
-    res.setHeader('Cache-Control', 'public, max-age=720');
     const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
     const sortBy = req.query.sortBy || 'DateCreated&SortName';
     const sortOrder = req.query.sortOrder || 'Descending';
@@ -158,15 +171,28 @@ router.get('/', async (req, res) => {
         const data = await home.json();
         const result = [];
         for (const libraryItem of data.Items) {
-            try {
-                const { items, error } = await fetchLibraryItems({ parentId: libraryItem.Id, host, sortBy, sortOrder, limit });
-                if (error) {
-                    result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: error.statusText || error.message });
-                    continue;
+            if(libraryItem.CollectionType == 'movies') {
+                try {
+                    const { items, error } = await fetchLibraryItems({ parentId: libraryItem.Id, host, sortBy, sortOrder, limit });
+                    if (error) {
+                        result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: error.statusText || error.message });
+                        continue;
+                    }
+                    result.push({ ...libraryItem, latest: items });
+                } catch (e) {
+                    result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: e.message });
                 }
-                result.push({ ...libraryItem, latest: items });
-            } catch (e) {
-                result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: e.message });
+            } else {
+                try {
+                    const { items, error } = await fetchLibraryItems({ parentId: libraryItem.Id, host, sortBy, sortOrder, limit, itemType: 'latest-tv' });
+                    if (error) {
+                        result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: error.statusText || error.message });
+                        continue;
+                    }
+                    result.push({ ...libraryItem, latest: items });
+                } catch (e) {
+                    result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: e.message });
+                }
             }
         }
         res.send(result);
@@ -181,15 +207,12 @@ router.get('/library', async (req, res) => {
     const id = req.query.id;
     const sortBy = req.query.sortBy;
     const sortOrder = req.query.sortOrder === 'asc' ? 'Ascending' : 'Descending';
+    const itemType = req.query.itemType || null;
     if (!id) {
         return res.status(400).send("Missing 'id' query parameter");
     }
     try {
         let url = `${monobar_endpoint}/Items?Ids=${id}&IncludeItemTypes=CollectionFolder`;
-        const { items, error } = await fetchLibraryItems({ parentId: id, host, sortBy, sortOrder });
-        if (error) {
-            return res.status(error.status || 500).send({ message: 'Error fetching library', error: error.statusText || error.message });
-        }
         const itemInfo = await fetch(url, {
             headers: {
                 'Content-Type': 'application/json',
@@ -200,7 +223,21 @@ router.get('/library', async (req, res) => {
             return res.status(itemInfo.status).send({ message: 'Error fetching library', error: itemInfo.statusText });
         }
         const libraryInfoData = await itemInfo.json();
-        res.send({ library: libraryInfoData.Items[0], content: items });
+        const library = libraryInfoData.Items[0];
+        let collectionType = library && library.CollectionType;
+        let fetchType = itemType;
+        if (!fetchType) {
+            if (collectionType === 'tvshows' || collectionType === 'tvshowsseries' || collectionType === 'tv') {
+                fetchType = 'series';
+            } else {
+                fetchType = null;
+            }
+        }
+        const { items, error } = await fetchLibraryItems({ parentId: id, host, sortBy, sortOrder, itemType: fetchType });
+        if (error) {
+            return res.status(error.status || 500).send({ message: 'Error fetching library', error: error.statusText || error.message });
+        }
+        res.send({ library, content: items });
     } catch (e) {
         res.status(500).send("Internal Server Error: " + e.message);
     }
@@ -233,7 +270,6 @@ async function getItemInfo({ id, host }) {
             }
             data.ImageTags = newImageTags;
         }
-        // Replace people image URLs
         if (Array.isArray(data.People)) {
             data.People = data.People.map(person => ({
                 ...person,
@@ -306,7 +342,6 @@ async function getEmbyPlaybackInfo({ id, maxWidth, maxHeight, maxBitrate, label,
                         "MaxAudioChannels": "6",
                         "MinSegments": "1",
                         "BreakOnNonKeyFrames": true,
-                        // "ManifestSubtitles": "vtt"
                     }
                 ],
                 "CodecProfiles": [
@@ -330,9 +365,6 @@ async function getEmbyPlaybackInfo({ id, maxWidth, maxHeight, maxBitrate, label,
     if (!playbackInfo.MediaSources || !playbackInfo.MediaSources[0]) return null;
     const ms = playbackInfo.MediaSources && playbackInfo.MediaSources[0];
     if (!ms || !ms.TranscodingUrl) return null;
-    
-
-    
     return { 
         ms, 
         label, 
@@ -364,7 +396,6 @@ router.get('/watch', async (req, res) => {
                 ...itemInfo,
                 recommendation: recommendation || [],
             };
-            // console.log(result)
             res.send(result);
         } catch (e) {
             res.status(500).send("Internal Server Error: " + e.message);
@@ -388,8 +419,30 @@ router.get('/watch', async (req, res) => {
             }
             const infoData = await getItemInfo({ id, host });
             let subtitlesArr = [];
+            let chaptersArr = [];
             if (infoData.MediaSources && infoData.MediaSources.length > 0) {
                 const mediaSourceId = infoData.MediaSources[0].Id;
+                // Build chapters array for ArtPlayer
+                const chapters = infoData.MediaSources[0].Chapters || [];
+                const durationTicks = infoData.MediaSources[0].RunTimeTicks || infoData.RunTimeTicks || null;
+                for (let i = 0; i < chapters.length; i++) {
+                    const chapter = chapters[i];
+                    const nextChapter = chapters[i + 1];
+                    const start = chapter.StartPositionTicks / 10000000;
+                    let end;
+                    if (nextChapter) {
+                        end = nextChapter.StartPositionTicks / 10000000;
+                    } else if (durationTicks) {
+                        end = durationTicks / 10000000;
+                    } else {
+                        end = start + 10; // fallback: 10s duration
+                    }
+                    chaptersArr.push({
+                        start,
+                        end,
+                        title: chapter.Name || `Chapter ${i + 1}`
+                    });
+                }
                 for (let subitem of infoData.MediaSources[0].MediaStreams || []) {
                     if (subitem.IsTextSubtitleStream) {
                         const subtitleUrl = `${host}/monobar/watch/subtitle?subIndex=${subitem.Index}&itemId=${id}&mediaSourceId=${mediaSourceId}&format=vtt`;
@@ -418,6 +471,7 @@ router.get('/watch', async (req, res) => {
             res.send({
                 ...infoData,
                 subtitles: subtitlesArr,
+                Chapters: chaptersArr,
                 playbackUrl
             });
         } catch (e) {
@@ -450,7 +504,6 @@ router.get('/watch/master/playlist', async (req, res) => {
     }
     try {
         const itemInfo = await getItemInfo({ id, host });
-        // console.log("Item Info:", itemInfo);
         const width = itemInfo.Width || (itemInfo.MediaStreams && itemInfo.MediaStreams.find(s => s.Type === 'Video')?.Width);
         const height = itemInfo.Height || (itemInfo.MediaStreams && itemInfo.MediaStreams.find(s => s.Type === 'Video')?.Height);
         const allQualities = [
@@ -473,7 +526,6 @@ router.get('/watch/master/playlist', async (req, res) => {
         if (allowedQualities.length === 0) {
             allowedQualities.push(allQualities[0]);
         }
-        // console.log("Allowed qualities:", allowedQualities);
         const variantInfos = [];
         
         for (const q of allowedQualities) {
@@ -649,7 +701,6 @@ router.get('/watch/main/segment/*', async (req, res) => {
             res.setHeader('Content-Length', contentLength);
         }
         if (segmentResponse.body) {
-            // console.log("Streaming segment:", segmentResponse.url);
             const nodeStream = Readable.fromWeb(segmentResponse.body);
             nodeStream.pipe(res);
             await new Promise((resolve, reject) => {
