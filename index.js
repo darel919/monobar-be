@@ -474,27 +474,43 @@ router.get('/play', async (req, res) => {
     } else if (session.lastAudioStreamIndex !== undefined) {
         audioStreamIndex = session.lastAudioStreamIndex;
     }
+    // Fetch available audio streams
+    let audioStreamIndexes = [audioStreamIndex];
+    try {
+        const infoRes = await fetch(`${monobar_endpoint}/Users/${monobar_user}/Items/${id}/?fields=MediaStreams`, {
+            headers: { 'X-Emby-Token': monobar_token }
+        });
+        if (infoRes.ok) {
+            const info = await infoRes.json();
+            if (info.MediaStreams) {
+                audioStreamIndexes = info.MediaStreams.filter(s => s.Type === 'Audio').map(s => s.Index);
+            }
+        }
+    } catch (e) {}
+    // Start all transcodes for 360p, 480p, 720p and all audio streams
     const allQualities = [
         { label: '360p', maxWidth: 640, maxHeight: 360, maxBitrate: 1000000 },
         { label: '480p', maxWidth: 854, maxHeight: 480, maxBitrate: 1750000 },
         { label: '720p', maxWidth: 1280, maxHeight: 720, maxBitrate: 3000000 },
     ];
-    const quality = allQualities.find(x => x.label === q);
-    if (!quality) return res.status(400).send("Invalid quality");
-    const info = await getEmbyPlaybackInfo({ id, ...quality, genSessionId, audioStreamIndex });
-    if (!info) return res.status(500).send("Failed to get playback info");
-    if (!session.deviceId) {
-        if (info.ms.DeviceId) {
-            session.deviceId = info.ms.DeviceId;
-        } else if (info.ms.TranscodingUrl) {
-            const urlObj = new URL(info.ms.TranscodingUrl, 'http://dummy');
-            const deviceIdFromUrl = urlObj.searchParams.get('DeviceId');
-            if (deviceIdFromUrl) session.deviceId = deviceIdFromUrl;
+    for (const quality of allQualities) {
+        for (const aIdx of audioStreamIndexes) {
+            const embyKey = `${quality.label}:${aIdx}`;
+            if (!session.embySessionIds[embyKey]) {
+                const playSessionId = await getEmbyPlaySessionId({
+                    id,
+                    maxWidth: quality.maxWidth,
+                    maxHeight: quality.maxHeight,
+                    maxBitrate: quality.maxBitrate,
+                    genSessionId,
+                    audioStreamIndex: aIdx
+                });
+                if (playSessionId) {
+                    session.embySessionIds[embyKey] = playSessionId;
+                }
+            }
         }
     }
-    const embyKey = audioStreamIndex !== undefined ? `${q}:${audioStreamIndex}` : q;
-    session.embySessionIds[embyKey] = info.ms.PlaySessionId || info.playSessionId;
-    session.lastAudioStreamIndex = audioStreamIndex;
     const playlistUrl = `${host}/monobar/play/playlist?id=${id}&genSessionId=${genSessionId}&q=${q}`;
     res.redirect(playlistUrl);
 });
@@ -1121,7 +1137,7 @@ router.post('/status', async (req, res) => {
         body = {
             ...baseBody,
             IsPaused: false,
-            PositionTicks: positionTicks || 90000,
+            PositionTicks: positionTicks,
             PlaybackStartTimeTicks: playbackStartTimeTicks,
             SubtitleStreamIndex: currentSubtitleIndex,
             AudioStreamIndex: currentAudioIndex,
@@ -1134,7 +1150,7 @@ router.post('/status', async (req, res) => {
         body = {
             ...baseBody,
             IsPaused: false,
-            PositionTicks: positionTicks || 90000,
+            PositionTicks: positionTicks,
             PlaybackStartTimeTicks: playbackStartTimeTicks,
             SubtitleStreamIndex: currentSubtitleIndex,
             AudioStreamIndex: currentAudioIndex,
@@ -1146,7 +1162,7 @@ router.post('/status', async (req, res) => {
         body = {
             ...baseBody,
             IsPaused: true,
-            PositionTicks: positionTicks || 118760670,
+            PositionTicks: positionTicks,
             PlaybackStartTimeTicks: playbackStartTimeTicks,
             SubtitleStreamIndex: currentSubtitleIndex,
             AudioStreamIndex: currentAudioIndex,
@@ -1158,7 +1174,7 @@ router.post('/status', async (req, res) => {
         body = {
             ...baseBody,
             IsPaused: false,
-            PositionTicks: positionTicks || 118760670,
+            PositionTicks: positionTicks,
             PlaybackStartTimeTicks: playbackStartTimeTicks,
             SubtitleStreamIndex: currentSubtitleIndex,
             AudioStreamIndex: currentAudioIndex,
@@ -1197,13 +1213,11 @@ router.delete('/status', async (req, res) => {
     }
     let foundKey = null;
     let foundSession = null;
-    let foundQuality = null;
     for (const [key, session] of playSessionCache.entries()) {
-        for (const [quality, embyId] of Object.entries(session.embySessionIds || {})) {
+        for (const embyId of Object.values(session.embySessionIds || {})) {
             if (embyId === playSessionId) {
                 foundKey = key;
                 foundSession = session;
-                foundQuality = quality;
                 break;
             }
         }
@@ -1230,17 +1244,15 @@ router.delete('/status', async (req, res) => {
                 return res.status(500).send("Failed to stop Emby transcodes: " + e.message);
             }
         }
-    } else if (foundSession && foundSession.deviceId && foundQuality) {
+    } else if (foundSession && foundSession.deviceId) {
         try {
-            await stopEmbyTranscode(foundSession.deviceId, playSessionId);
-            delete foundSession.embySessionIds[foundQuality];
-            const stillActive = Object.keys(foundSession.embySessionIds).length > 0;
-            if (!stillActive) {
-                playSessionCache.delete(foundKey);
+            for (const embyId of Object.values(foundSession.embySessionIds)) {
+                await stopEmbyTranscode(foundSession.deviceId, embyId);
             }
-            return res.send({ message: 'Status deleted and Emby transcode stopped successfully' });
+            playSessionCache.delete(foundKey);
+            return res.send({ message: 'Status deleted and Emby transcodes stopped successfully' });
         } catch (e) {
-            return res.status(500).send("Failed to stop Emby transcode: " + e.message);
+            return res.status(500).send("Failed to stop Emby transcodes: " + e.message);
         }
     }
     return res.status(404).send("Session not found in cache for this playSessionId");
