@@ -10,8 +10,13 @@ const monobar_user = process.env.MONOBAR_USER
 
 const playSessionCache = new Map();
 
-function generateGenSessionId() {
-    return crypto.randomBytes(16).toString('hex');
+// Utility to normalize IPv4, IPv6-mapped IPv4, and IPv6 loopback addresses
+function normalizeIp(ip) {
+    if (typeof ip === 'string') {
+        if (ip === '::1') return '127.0.0.1';
+        if (ip.startsWith('::ffff:')) return ip.replace('::ffff:', '');
+    }
+    return ip;
 }
 
 async function fetchLibraryItems({ parentId, host, sortBy, sortOrder, limit, itemType }) {
@@ -125,7 +130,10 @@ async function stopEmbyTranscode(deviceId, playSessionId) {
             },
         });
         await response.text();
-    } catch (e) {}
+        console.log(`Stopped Emby transcode for playSessionId: ${playSessionId}`);
+    } catch (e) {
+        console.log(`Error stopping Emby transcode for playSessionId: ${playSessionId}:`, e);
+    }
 }
 
 router.use((req, res, next) => {
@@ -151,6 +159,33 @@ router.post('/ping', async (req, res) => {
         viaNginxProxy: req.headers['x-nginx-proxy'] || null,
     };
     res.send(response);
+});
+
+router.get('/cache', (req, res) => {
+    try {
+        const cacheData = Object.fromEntries(playSessionCache);
+        // if(cacheData.length == 0) {
+        //     return res.send({ message: 'Cache is empty.' });
+        // }
+        res.send(cacheData);
+    } catch (e) {
+        res.status(500).send({ message: 'Failed to fetch cache data.', error: e.message });
+    }
+});
+router.get('/cache/clear', async (req, res) => {
+    try {
+        for (const [item, session] of playSessionCache.entries()) {
+            if (session && session.embySessionIds) {
+                for (const playSessionId of Object.values(session.embySessionIds)) {
+                    await stopEmbyTranscode(session.deviceId, playSessionId);
+                }
+            }
+            playSessionCache.delete(item);
+        }
+        res.status(200).send({ message: 'Cache cleared and all Emby transcodes stopped.' });
+    } catch (e) {
+        res.status(500).send({ message: 'Failed to clear cache or stop Emby transcodes.', error: e.message });
+    }
 });
 
 router.get('/', async (req, res) => {
@@ -380,6 +415,7 @@ router.get('/watch', async (req, res) => {
     const id = req.query.id;
     const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
     const intent = req.query.intent;
+    const genSessionId = req.headers['x-session-id']; // Get from client
     if (!id) {
         return res.status(400).send("Missing 'id' query parameter");
     }
@@ -401,13 +437,17 @@ router.get('/watch', async (req, res) => {
             res.status(500).send("Internal Server Error: " + e.message);
         }
     } else if (intent == 'play') {
+        if (!genSessionId) {
+            return res.status(400).send("Missing 'genSessionId' parameter");
+        }
         try {
             const deviceId = req.query.DeviceId;
-            const sessionKey = `${id}:${req.ip}`;
+            const normIp = normalizeIp(req.ip);
+            const sessionKey = `${id}:${normIp}`;
             let session = playSessionCache.get(sessionKey);
             if (!session) {
                 session = {
-                    genSessionId: generateGenSessionId(),
+                    genSessionId: genSessionId, // Use client-supplied value
                     embySessionIds: {},
                     deviceId: deviceId || undefined,
                     lastAccessed: Date.now(),
@@ -416,6 +456,7 @@ router.get('/watch', async (req, res) => {
             } else {
                 session.lastAccessed = Date.now();
                 if (deviceId) session.deviceId = deviceId;
+                if (genSessionId) session.genSessionId = genSessionId; // Update if supplied
             }
             const infoData = await getItemInfo({ id, host });
             let subtitlesArr = [];
@@ -484,15 +525,16 @@ router.get('/watch', async (req, res) => {
 
 router.get('/watch/master/playlist', async (req, res) => {
     const id = req.query.id;
-    const genSessionId = req.query.genSessionId;
+    const genSessionId = req.query.genSessionId; // Get from client
+    if (!id || !genSessionId) return res.status(400).send("Missing 'id' or 'genSessionId' query parameter");
     const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
     const deviceId = req.query.DeviceId;
-    if (!id || !genSessionId) return res.status(400).send("Missing 'id' or 'genSessionId' query parameter");
-    const sessionKey = `${id}:${req.ip}`;
+    const normIp = normalizeIp(req.ip);
+    const sessionKey = `${id}:${normIp}`;
     let session = playSessionCache.get(sessionKey);
     if (!session) {
         session = {
-            genSessionId,
+            genSessionId: genSessionId, // Use client-supplied value
             embySessionIds: {},
             deviceId: deviceId || undefined,
             lastAccessed: Date.now(),
@@ -501,6 +543,7 @@ router.get('/watch/master/playlist', async (req, res) => {
     } else {
         session.lastAccessed = Date.now();
         if (deviceId) session.deviceId = deviceId;
+        if (genSessionId) session.genSessionId = genSessionId; // Update if supplied
     }
     try {
         const itemInfo = await getItemInfo({ id, host });
@@ -760,6 +803,7 @@ router.delete('/status', async (req, res) => {
     let foundKey = null;
     let foundSession = null;
     let foundQuality = null;
+    // First, look for playSessionId in embySessionIds
     for (const [key, session] of playSessionCache.entries()) {
         for (const [quality, embyId] of Object.entries(session.embySessionIds || {})) {
             if (embyId === playSessionId) {
@@ -771,6 +815,7 @@ router.delete('/status', async (req, res) => {
         }
         if (foundSession) break;
     }
+    // If not found, look for playSessionId as genSessionId
     if (!foundSession) {
         for (const [key, session] of playSessionCache.entries()) {
             if (session.genSessionId === playSessionId) {
@@ -781,6 +826,7 @@ router.delete('/status', async (req, res) => {
         }
         if (foundSession) {
             try {
+                // Always clean up all embySessionIds if present
                 if (foundSession.embySessionIds && foundSession.deviceId) {
                     for (const embyId of Object.values(foundSession.embySessionIds)) {
                         await stopEmbyTranscode(foundSession.deviceId, embyId);
