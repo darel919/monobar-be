@@ -19,6 +19,10 @@ function normalizeIp(ip) {
     return ip;
 }
 
+function secondsToTicks(seconds) {
+    return Math.round(seconds * 10000000);
+}
+
 async function fetchLibraryItems({ parentId, host, sortBy, sortOrder, limit, itemType }) {
     let url;
     if (itemType === 'series') {
@@ -35,7 +39,7 @@ async function fetchLibraryItems({ parentId, host, sortBy, sortOrder, limit, ite
         // For latest TV items (used in / endpoint)
         url = `${monobar_endpoint}/Users/${monobar_user}/Items/Latest?ParentId=${parentId}` +
             `&Fields=BasicSyncInfo,ProductionYear,Overview,Status,EndDate` +
-            `&IncludeImageTypes=Primary,Backdrop,Thumb` +
+            `&IncludeImageTypes=Primary,Backdrop,Thumb&StartIndex=0` +
             (sortBy ? `&SortBy=${encodeURIComponent(sortBy)}` : '') +
             (sortOrder ? `&SortOrder=${encodeURIComponent(sortOrder)}` : '') +
             (limit ? `&Limit=${encodeURIComponent(limit)}` : '');
@@ -190,7 +194,8 @@ router.get('/cache/clear', async (req, res) => {
 
 router.get('/', async (req, res) => {
     const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
-    const sortBy = req.query.sortBy || 'DateCreated&SortName';
+    const sortBy = req.query.sortBy || 'DateCreated';
+    // const sortBy = 'DateCreated';
     const sortOrder = req.query.sortOrder || 'Descending';
     const limit = 10;
     try {
@@ -217,18 +222,19 @@ router.get('/', async (req, res) => {
                 } catch (e) {
                     result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: e.message });
                 }
-            } else {
-                try {
-                    const { items, error } = await fetchLibraryItems({ parentId: libraryItem.Id, host, sortBy, sortOrder, limit, itemType: 'latest-tv' });
-                    if (error) {
-                        result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: error.statusText || error.message });
-                        continue;
-                    }
-                    result.push({ ...libraryItem, latest: items });
-                } catch (e) {
-                    result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: e.message });
-                }
-            }
+            } 
+            // else {
+            //     try {
+            //         const { items, error } = await fetchLibraryItems({ parentId: libraryItem.Id, host, sortBy, sortOrder, limit, itemType: 'latest-tv' });
+            //         if (error) {
+            //             result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: error.statusText || error.message });
+            //             continue;
+            //         }
+            //         result.push({ ...libraryItem, latest: items });
+            //     } catch (e) {
+            //         result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: e.message });
+            //     }
+            // }
         }
         res.send(result);
     } catch (e) {
@@ -415,7 +421,6 @@ router.get('/watch', async (req, res) => {
     const id = req.query.id;
     const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
     const intent = req.query.intent;
-    const genSessionId = req.headers['x-session-id']; // Get from client
     if (!id) {
         return res.status(400).send("Missing 'id' query parameter");
     }
@@ -423,20 +428,74 @@ router.get('/watch', async (req, res) => {
         return res.status(400).send("Missing 'intent' query parameter");
     }
     if (intent == 'info') {
+        // genSessionId is NOT required for info intent
         try {
-            const [itemInfo, recommendation] = await Promise.all([
+            const [infoData, recommendation] = await Promise.all([
                 getItemInfo({ id, host }),
                 getRecommendationInfo({ id, host })
             ]);
-            const result = {
-                ...itemInfo,
-                recommendation: recommendation || [],
-            };
-            res.send(result);
+            let subtitlesArr = [];
+            let chaptersArr = [];
+            if (infoData.MediaSources && infoData.MediaSources.length > 0) {
+                const mediaSourceId = infoData.MediaSources[0].Id;
+                // Build chapters array for ArtPlayer
+                const chapters = infoData.MediaSources[0].Chapters || [];
+                const durationTicks = infoData.MediaSources[0].RunTimeTicks || infoData.RunTimeTicks || null;
+                for (let i = 0; i < chapters.length; i++) {
+                    const chapter = chapters[i];
+                    const nextChapter = chapters[i + 1];
+                    const start = chapter.StartPositionTicks / 10000000;
+                    let end;
+                    if (nextChapter) {
+                        end = nextChapter.StartPositionTicks / 10000000;
+                    } else if (durationTicks) {
+                        end = durationTicks / 10000000;
+                    } else {
+                        end = start + 10; // fallback: 10s duration
+                    }
+                    chaptersArr.push({
+                        start,
+                        end,
+                        title: chapter.Name || `Chapter ${i + 1}`
+                    });
+                }
+                for (let subitem of infoData.MediaSources[0].MediaStreams || []) {
+                    if (subitem.IsTextSubtitleStream) {
+                        const subtitleUrl = `${host}/monobar/watch/subtitle?subIndex=${subitem.Index}&itemId=${id}&mediaSourceId=${mediaSourceId}&format=vtt`;
+                        if (subitem.Index === 0) {
+                            subtitlesArr.push({
+                                default: true,
+                                url: subtitleUrl,
+                                html: subitem.DisplayTitle,
+                                name: subitem.DisplayTitle,
+                                format: 'vtt',
+                                index: subitem.Index
+                            });
+                        } else {
+                            subtitlesArr.push({
+                                url: subtitleUrl,
+                                html: subitem.DisplayTitle,
+                                name: subitem.DisplayTitle,
+                                format: 'vtt',
+                                index: subitem.Index
+                            });
+                        }
+                    }
+                }
+            }
+            // Do NOT include playbackUrl for info intent
+            res.send({
+                ...infoData,
+                subtitles: subtitlesArr,
+                Chapters: chaptersArr,
+                recommendation: recommendation || []
+            });
         } catch (e) {
             res.status(500).send("Internal Server Error: " + e.message);
         }
-    } else if (intent == 'play') {
+    }
+    else if (intent == 'play') {
+        const genSessionId = req.headers['x-session-id'];
         if (!genSessionId) {
             return res.status(400).send("Missing 'genSessionId' parameter");
         }
@@ -792,6 +851,186 @@ router.get('/watch/subtitle', async (req, res) => {
         res.send(subtitleData);
     } catch (e) {
         res.status(500).send("Internal Server Error: " + e.message);
+    }
+});
+
+router.post('/status', async (req, res) => {
+    const playSessionId = req.body.playSessionId;
+    const intent = req.body.intent;
+    if (!playSessionId) {
+        return res.status(400).send("Missing 'playSessionId' parameter");
+    }
+    
+    if (!intent) {
+        return res.status(400).send("Missing 'intent' parameter");
+    }
+
+    let foundKey = null;
+    let foundSession = null;
+
+    // Search for the session by genSessionId
+    for (const [key, session] of playSessionCache.entries()) {
+        if (session.genSessionId === playSessionId) {
+            foundKey = key;
+            foundSession = session;
+            break;
+        }
+    }
+
+    if (!foundSession) {
+        return res.status(404).send("Session not found in cache for this playSessionId");
+    }
+
+    try {
+        switch (intent) {
+            case 'stop':
+                try {
+                    const embyProgressBody = {
+                        BufferedRanges: [],
+                        SeekableRanges: [],
+                        PositionTicks: secondsToTicks(req.body.currentTime),
+                        AudioStreamIndex: req.body.currentAudioIndex || 1,
+                        ItemId: req.body.itemId,
+                        PlaySessionId: Object.values(foundSession.embySessionIds)[0] || playSessionId,
+                        IsPaused: false,
+                        PlaybackRate: 1,
+                        VolumeLevel: 100,
+                        CanSeek: true
+                    };
+
+                    const response = await fetch(`${monobar_endpoint}/Sessions/Playing/Stopped`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Emby-Token': monobar_token
+                        },
+                        body: JSON.stringify(embyProgressBody)
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`Failed to update progress: ${response.statusText}`);
+                    }
+
+                    // Stop all associated transcodes if we have deviceId and embySessionIds
+                    if (foundSession.embySessionIds && foundSession.deviceId) {
+                        for (const embyId of Object.values(foundSession.embySessionIds)) {
+                            await stopEmbyTranscode(foundSession.deviceId, embyId);
+                        }
+                    }
+                    // Remove the session from cache
+                    playSessionCache.delete(foundKey);
+
+                    return res.sendStatus(204);
+                } catch (error) {
+                    console.error('Error updating playback progress:', error);
+                    return res.status(500).send({ message: 'Failed to update playback progress', error: error.message });
+                }
+
+
+            case 'timeupdate':
+                try {
+                    const embyProgressBody = {
+                        EventName: "timeupdate",
+                        BufferedRanges: req.body.bufferedRange ? [{
+                            start: secondsToTicks(req.body.bufferedRange.start) || 0,
+                            end: secondsToTicks(req.body.bufferedRange.end)
+                        }] : [],
+                        SeekableRanges: req.body.seekableRange ? [{
+                            start: secondsToTicks(req.body.seekableRange.start) || 0,
+                            end: secondsToTicks(req.body.seekableRange.end)
+                        }] : [],
+                        PositionTicks: secondsToTicks(req.body.currentTime),
+                        AudioStreamIndex: req.body.currentAudioIndex || 1,
+                        ItemId: req.body.itemId,
+                        PlaySessionId: Object.values(foundSession.embySessionIds)[0] || playSessionId,
+                        IsPaused: false,
+                        PlaybackRate: 1,
+                        VolumeLevel: 100,
+                        CanSeek: true
+                    };
+
+                    const response = await fetch(`${monobar_endpoint}/Sessions/Playing/Progress`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Emby-Token': monobar_token
+                        },
+                        body: JSON.stringify(embyProgressBody)
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`Failed to update progress: ${response.statusText}`);
+                    }
+
+                    // Update session cache
+                    foundSession.lastAccessed = Date.now();
+                    foundSession.currentTime = req.body.currentTime;
+
+                    return res.sendStatus(204);
+                } catch (error) {
+                    console.error('Error updating playback progress:', error);
+                    return res.status(500).send({ message: 'Failed to update playback progress', error: error.message });
+                }
+
+            case 'pause':
+                try {
+                    const embyProgressBody = {
+                        EventName: "pause",
+                        BufferedRanges: req.body.seekableRange ? [{
+                            start: 0,
+                            end: secondsToTicks(req.body.seekableRange.end)
+                        }] : [],
+                        SeekableRanges: req.body.seekableRange ? [{
+                            start: 0,
+                            end: secondsToTicks(req.body.seekableRange.end)
+                        }] : [],
+                        PositionTicks: secondsToTicks(req.body.currentTime),
+                        AudioStreamIndex: req.body.currentAudioIndex || 1,
+                        ItemId: req.body.itemId,
+                        PlaySessionId: Object.values(foundSession.embySessionIds)[0] || playSessionId,
+                        IsPaused: true,
+                        PlaybackRate: 1,
+                        VolumeLevel: 100,
+                        CanSeek: true
+                    };
+
+                    const response = await fetch(`${monobar_endpoint}/Sessions/Playing/Progress`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Emby-Token': monobar_token
+                        },
+                        body: JSON.stringify(embyProgressBody)
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`Failed to update progress: ${response.statusText}`);
+                    }
+
+                    // Update session cache
+                    foundSession.lastAccessed = Date.now();
+                    foundSession.currentTime = req.body.currentTime;
+
+                    return res.sendStatus(204);
+                } catch (error) {
+                    console.error('Error updating playback progress:', error);
+                    return res.status(500).send({ message: 'Failed to update playback progress', error: error.message });
+                }
+
+            case 'unpause':
+            case 'play':
+                // foundSession.playbackState = 'playing';
+                // foundSession.lastAccessed = Date.now();
+                // if (req.body.currentTime) {
+                //     foundSession.currentTime = req.body.currentTime;
+                // }
+                return res.sendStatus(204);
+
+            default:
+                return res.status(400).send(`Invalid intent parameter: ${intent}. Supported intents are: stop, timeupdate, pause, unpause, play`);
+        }
+    } catch (e) {
+        return res.status(500).send(`Failed to process ${intent} intent: ${e.message}`);
     }
 });
 
