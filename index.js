@@ -10,7 +10,27 @@ const monobar_user = process.env.MONOBAR_USER
 
 const playSessionCache = new Map();
 
-// Utility to normalize IPv4, IPv6-mapped IPv4, and IPv6 loopback addresses
+function getOrCreateSession(sessionKey, genSessionId, deviceId = undefined) {    for (const [existingKey, existingSession] of playSessionCache.entries()) {
+        if (existingSession.genSessionId === genSessionId) {
+            playSessionCache.delete(existingKey);
+            const updatedSession = {
+                ...existingSession,
+                deviceId: deviceId || existingSession.deviceId,
+                lastAccessed: Date.now()
+            };            playSessionCache.set(sessionKey, updatedSession);
+            return updatedSession;
+        }
+    }
+    const newSession = {
+        genSessionId,
+        embySessionIds: {},
+        deviceId,
+        lastAccessed: Date.now(),
+    };
+    playSessionCache.set(sessionKey, newSession);
+    return newSession;
+}
+
 function normalizeIp(ip) {
     if (typeof ip === 'string') {
         if (ip === '::1') return '127.0.0.1';
@@ -23,10 +43,8 @@ function secondsToTicks(seconds) {
     return Math.round(seconds * 10000000);
 }
 
-async function fetchLibraryItems({ parentId, host, sortBy, sortOrder, limit, itemType }) {
-    let url;
-    if (itemType === 'series') {
-        // Fetch TV series, not episodes
+async function fetchLibraryItems({ parentId, host, sortBy, sortOrder, limit, itemType, searchTerm }) {
+    let url;    if (itemType === 'series') {
         url = `${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${parentId}` +
             `&IncludeItemTypes=Series` +
             `&Fields=BasicSyncInfo,CanDelete,CanDownload,PrimaryImageAspectRatio,ProductionYear,Status,EndDate` +
@@ -34,17 +52,25 @@ async function fetchLibraryItems({ parentId, host, sortBy, sortOrder, limit, ite
             (sortBy ? `&SortBy=${encodeURIComponent(sortBy)}` : '') +
             (sortOrder ? `&SortOrder=${encodeURIComponent(sortOrder)}` : '') +
             `&EnableImageTypes=Primary,Backdrop,Thumb&ImageTypeLimit=1&Recursive=true` +
-            (limit ? `&Limit=${encodeURIComponent(limit)}` : '');
-    } else if (itemType === 'latest-tv') {
-        // For latest TV items (used in / endpoint)
+            (limit ? `&Limit=${encodeURIComponent(limit)}` : '');    } else if (itemType === 'latest-tv') {
         url = `${monobar_endpoint}/Users/${monobar_user}/Items/Latest?ParentId=${parentId}` +
             `&Fields=BasicSyncInfo,ProductionYear,Overview,Status,EndDate` +
             `&IncludeImageTypes=Primary,Backdrop,Thumb&StartIndex=0` +
             (sortBy ? `&SortBy=${encodeURIComponent(sortBy)}` : '') +
             (sortOrder ? `&SortOrder=${encodeURIComponent(sortOrder)}` : '') +
             (limit ? `&Limit=${encodeURIComponent(limit)}` : '');
-    } else {
-        // Default: movies/items
+    } else if (itemType === 'search') {
+        url = `${monobar_endpoint}/Users/${monobar_user}/Items` +
+            `?IncludeItemTypes=Movie` +
+            `&Fields=BasicSyncInfo,ProductionYear,Overview,Status,EndDate` +
+            `&StartIndex=0` +
+            `&IncludeImageTypes=Primary,Backdrop,Thumb` +
+            `&Recursive=true` +
+            `&SearchTerm=${searchTerm}` +
+            `&IncludeSearchTypes=false` +
+            (sortBy ? `&SortBy=${encodeURIComponent(sortBy)}` : '') +
+            (sortOrder ? `&SortOrder=${encodeURIComponent(sortOrder)}` : '') +
+            (limit ? `&Limit=${encodeURIComponent(limit)}` : '');    } else {
         url = `${monobar_endpoint}/Users/${monobar_user}/Items?ParentId=${parentId}` +
             `&Fields=BasicSyncInfo,ProductionYear,Overview` +
             `&StartIndex=0&Recursive=true&Filters=IsNotFolder&IncludeImageTypes=Logo` +
@@ -165,12 +191,8 @@ router.post('/ping', async (req, res) => {
     res.send(response);
 });
 
-router.get('/cache', (req, res) => {
-    try {
+router.get('/cache', (req, res) => {    try {
         const cacheData = Object.fromEntries(playSessionCache);
-        // if(cacheData.length == 0) {
-        //     return res.send({ message: 'Cache is empty.' });
-        // }
         res.send(cacheData);
     } catch (e) {
         res.status(500).send({ message: 'Failed to fetch cache data.', error: e.message });
@@ -193,9 +215,7 @@ router.get('/cache/clear', async (req, res) => {
 });
 
 router.get('/', async (req, res) => {
-    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
-    const sortBy = req.query.sortBy || 'DateCreated';
-    // const sortBy = 'DateCreated';
+    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;    const sortBy = req.query.sortBy || 'DateCreated';
     const sortOrder = req.query.sortOrder || 'Descending';
     const limit = 10;
     try {
@@ -221,20 +241,7 @@ router.get('/', async (req, res) => {
                     result.push({ ...libraryItem, latest: items });
                 } catch (e) {
                     result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: e.message });
-                }
-            } 
-            // else {
-            //     try {
-            //         const { items, error } = await fetchLibraryItems({ parentId: libraryItem.Id, host, sortBy, sortOrder, limit, itemType: 'latest-tv' });
-            //         if (error) {
-            //             result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: error.statusText || error.message });
-            //             continue;
-            //         }
-            //         result.push({ ...libraryItem, latest: items });
-            //     } catch (e) {
-            //         result.push({ name: libraryItem.Name, Id: libraryItem.Id, latest: [], error: e.message });
-            //     }
-            // }
+                }            }
         }
         res.send(result);
     } catch (e) {
@@ -426,9 +433,7 @@ router.get('/watch', async (req, res) => {
     }
     if (!intent) {
         return res.status(400).send("Missing 'intent' query parameter");
-    }
-    if (intent == 'info') {
-        // genSessionId is NOT required for info intent
+    }    if (intent == 'info') {
         try {
             const [infoData, recommendation] = await Promise.all([
                 getItemInfo({ id, host }),
@@ -438,7 +443,7 @@ router.get('/watch', async (req, res) => {
             let chaptersArr = [];
             if (infoData.MediaSources && infoData.MediaSources.length > 0) {
                 const mediaSourceId = infoData.MediaSources[0].Id;
-                // Build chapters array for ArtPlayer
+
                 const chapters = infoData.MediaSources[0].Chapters || [];
                 const durationTicks = infoData.MediaSources[0].RunTimeTicks || infoData.RunTimeTicks || null;
                 for (let i = 0; i < chapters.length; i++) {
@@ -483,7 +488,7 @@ router.get('/watch', async (req, res) => {
                     }
                 }
             }
-            // Do NOT include playbackUrl for info intent
+
             res.send({
                 ...infoData,
                 subtitles: subtitlesArr,
@@ -503,26 +508,13 @@ router.get('/watch', async (req, res) => {
             const deviceId = req.query.DeviceId;
             const normIp = normalizeIp(req.ip);
             const sessionKey = `${id}:${normIp}`;
-            let session = playSessionCache.get(sessionKey);
-            if (!session) {
-                session = {
-                    genSessionId: genSessionId, // Use client-supplied value
-                    embySessionIds: {},
-                    deviceId: deviceId || undefined,
-                    lastAccessed: Date.now(),
-                };
-                playSessionCache.set(sessionKey, session);
-            } else {
-                session.lastAccessed = Date.now();
-                if (deviceId) session.deviceId = deviceId;
-                if (genSessionId) session.genSessionId = genSessionId; // Update if supplied
-            }
+            const session = getOrCreateSession(sessionKey, genSessionId, deviceId);
             const infoData = await getItemInfo({ id, host });
             let subtitlesArr = [];
             let chaptersArr = [];
             if (infoData.MediaSources && infoData.MediaSources.length > 0) {
                 const mediaSourceId = infoData.MediaSources[0].Id;
-                // Build chapters array for ArtPlayer
+
                 const chapters = infoData.MediaSources[0].Chapters || [];
                 const durationTicks = infoData.MediaSources[0].RunTimeTicks || infoData.RunTimeTicks || null;
                 for (let i = 0; i < chapters.length; i++) {
@@ -582,28 +574,14 @@ router.get('/watch', async (req, res) => {
     }
 });
 
-router.get('/watch/master/playlist', async (req, res) => {
-    const id = req.query.id;
-    const genSessionId = req.query.genSessionId; // Get from client
+router.get('/watch/master/playlist', async (req, res) => {    const id = req.query.id;
+    const genSessionId = req.query.genSessionId;
     if (!id || !genSessionId) return res.status(400).send("Missing 'id' or 'genSessionId' query parameter");
     const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
     const deviceId = req.query.DeviceId;
     const normIp = normalizeIp(req.ip);
     const sessionKey = `${id}:${normIp}`;
-    let session = playSessionCache.get(sessionKey);
-    if (!session) {
-        session = {
-            genSessionId: genSessionId, // Use client-supplied value
-            embySessionIds: {},
-            deviceId: deviceId || undefined,
-            lastAccessed: Date.now(),
-        };
-        playSessionCache.set(sessionKey, session);
-    } else {
-        session.lastAccessed = Date.now();
-        if (deviceId) session.deviceId = deviceId;
-        if (genSessionId) session.genSessionId = genSessionId; // Update if supplied
-    }
+    const session = getOrCreateSession(sessionKey, genSessionId, deviceId);
     try {
         const itemInfo = await getItemInfo({ id, host });
         const width = itemInfo.Width || (itemInfo.MediaStreams && itemInfo.MediaStreams.find(s => s.Type === 'Video')?.Width);
@@ -854,6 +832,40 @@ router.get('/watch/subtitle', async (req, res) => {
     }
 });
 
+router.get('/search', async (req, res) => {
+    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
+    const searchTerm = req.query.q;
+    const sortOrder = 'Ascending'; 
+    
+    if (!searchTerm) {
+        return res.status(400).send("Missing 'q' query parameter");
+    }
+
+    try {
+        const { items, error } = await fetchLibraryItems({ 
+            host,
+            searchTerm: encodeURIComponent(searchTerm),
+            sortBy: 'ProductionYear',
+            sortOrder,
+            limit: 50,
+            itemType: 'search' 
+        });        
+        if (error) {
+            return res.status(500).send({ message: 'Error searching items', error: error.message });
+        }
+
+        items.sort((a, b) => {
+            const yearA = a.ProductionYear || 0;
+            const yearB = b.ProductionYear || 0;
+            return yearA - yearB;
+        });
+
+        res.send(items);
+    } catch (e) {
+        res.status(500).send("Internal Server Error: " + e.message);
+    }
+});
+
 router.post('/status', async (req, res) => {
     const playSessionId = req.body.playSessionId;
     const intent = req.body.intent;
@@ -868,7 +880,6 @@ router.post('/status', async (req, res) => {
     let foundKey = null;
     let foundSession = null;
 
-    // Search for the session by genSessionId
     for (const [key, session] of playSessionCache.entries()) {
         if (session.genSessionId === playSessionId) {
             foundKey = key;
@@ -911,13 +922,12 @@ router.post('/status', async (req, res) => {
                         throw new Error(`Failed to update progress: ${response.statusText}`);
                     }
 
-                    // Stop all associated transcodes if we have deviceId and embySessionIds
                     if (foundSession.embySessionIds && foundSession.deviceId) {
                         for (const embyId of Object.values(foundSession.embySessionIds)) {
                             await stopEmbyTranscode(foundSession.deviceId, embyId);
                         }
                     }
-                    // Remove the session from cache
+
                     playSessionCache.delete(foundKey);
 
                     return res.sendStatus(204);
@@ -961,8 +971,6 @@ router.post('/status', async (req, res) => {
                     if (!response.ok) {
                         throw new Error(`Failed to update progress: ${response.statusText}`);
                     }
-
-                    // Update session cache
                     foundSession.lastAccessed = Date.now();
                     foundSession.currentTime = req.body.currentTime;
 
@@ -1006,8 +1014,6 @@ router.post('/status', async (req, res) => {
                     if (!response.ok) {
                         throw new Error(`Failed to update progress: ${response.statusText}`);
                     }
-
-                    // Update session cache
                     foundSession.lastAccessed = Date.now();
                     foundSession.currentTime = req.body.currentTime;
 
@@ -1019,11 +1025,6 @@ router.post('/status', async (req, res) => {
 
             case 'unpause':
             case 'play':
-                // foundSession.playbackState = 'playing';
-                // foundSession.lastAccessed = Date.now();
-                // if (req.body.currentTime) {
-                //     foundSession.currentTime = req.body.currentTime;
-                // }
                 return res.sendStatus(204);
 
             default:
@@ -1042,7 +1043,6 @@ router.delete('/status', async (req, res) => {
     let foundKey = null;
     let foundSession = null;
     let foundQuality = null;
-    // First, look for playSessionId in embySessionIds
     for (const [key, session] of playSessionCache.entries()) {
         for (const [quality, embyId] of Object.entries(session.embySessionIds || {})) {
             if (embyId === playSessionId) {
@@ -1054,7 +1054,6 @@ router.delete('/status', async (req, res) => {
         }
         if (foundSession) break;
     }
-    // If not found, look for playSessionId as genSessionId
     if (!foundSession) {
         for (const [key, session] of playSessionCache.entries()) {
             if (session.genSessionId === playSessionId) {
@@ -1065,7 +1064,6 @@ router.delete('/status', async (req, res) => {
         }
         if (foundSession) {
             try {
-                // Always clean up all embySessionIds if present
                 if (foundSession.embySessionIds && foundSession.deviceId) {
                     for (const embyId of Object.values(foundSession.embySessionIds)) {
                         await stopEmbyTranscode(foundSession.deviceId, embyId);
