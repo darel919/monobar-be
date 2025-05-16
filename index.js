@@ -2,7 +2,17 @@ import express from "express"
 import { URL, URLSearchParams } from 'url'
 import { Readable } from 'stream'
 import crypto from 'crypto'
+
 const router = express.Router()
+
+function getHost(headers) {
+    const environment = headers['x-environment']
+    if (environment === 'development' || environment === 'production_local') {
+        return 'http://10.10.10.10:328';
+    } else {
+        return 'https://api.darelisme.my.id'
+    }
+}
 
 const monobar_endpoint = process.env.MONOBAR_BACKEND
 const monobar_token = process.env.MONOBAR_TOKEN
@@ -215,7 +225,7 @@ router.get('/cache/clear', async (req, res) => {
 });
 
 router.get('/', async (req, res) => {
-    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;    const sortBy = req.query.sortBy || 'DateCreated';
+    const host = getHost(req.headers);const sortBy = req.query.sortBy || 'DateCreated';
     const sortOrder = req.query.sortOrder || 'Descending';
     const limit = 10;
     try {
@@ -251,7 +261,7 @@ router.get('/', async (req, res) => {
 
 router.get('/library', async (req, res) => {
     res.setHeader('Cache-Control', 'public, max-age=720');
-    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
+    const host = getHost(req.headers);
     const id = req.query.id;
     const sortBy = req.query.sortBy;
     const sortOrder = req.query.sortOrder === 'asc' ? 'Ascending' : 'Descending';
@@ -426,7 +436,7 @@ async function getEmbyPlaybackInfo({ id, maxWidth, maxHeight, maxBitrate, label,
 
 router.get('/watch', async (req, res) => {
     const id = req.query.id;
-    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
+    const host = getHost(req.headers);
     const intent = req.query.intent;
     if (!id) {
         return res.status(400).send("Missing 'id' query parameter");
@@ -577,7 +587,7 @@ router.get('/watch', async (req, res) => {
 router.get('/watch/master/playlist', async (req, res) => {    const id = req.query.id;
     const genSessionId = req.query.genSessionId;
     if (!id || !genSessionId) return res.status(400).send("Missing 'id' or 'genSessionId' query parameter");
-    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
+    const host = getHost(req.headers);
     const deviceId = req.query.DeviceId;
     const normIp = normalizeIp(req.ip);
     const sessionKey = `${id}:${normIp}`;
@@ -656,7 +666,7 @@ router.get('/watch/master/playlist', async (req, res) => {    const id = req.que
 });
 
 router.get('/watch/main/playlist', async (req, res) => {
-    const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
+    const host = getHost(req.headers);
     const deviceId = req.query.DeviceId;
     const mediaSourceId = req.query.MediaSourceId;
     const playSessionId = req.query.PlaySessionId;
@@ -833,6 +843,7 @@ router.get('/watch/subtitle', async (req, res) => {
 });
 
 router.get('/search', async (req, res) => {
+    res.setHeader('Cache-Control', 'public, max-age=3600');
     const host = req.headers['x-environment'] === 'development' ? 'http://10.10.10.10:328' : `https://api.darelisme.my.id`;
     const searchTerm = req.query.q;
     const sortOrder = 'Ascending'; 
